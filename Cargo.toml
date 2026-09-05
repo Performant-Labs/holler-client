@@ -9,6 +9,11 @@ license = "Proprietary"
 name = "holler_client"
 path = "src/lib.rs"
 
+[[bin]]
+name = "stub-acp"
+path = "tests/stub-acp/src/main.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
