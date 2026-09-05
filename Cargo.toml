@@ -1,0 +1,10 @@
+[package]
+name = "holler-client"
+version = "0.1.0"
+edition = "2021"
+description = "Thin client for the Holler talk circuit"
+license = "Proprietary"
+
+[lib]
+name = "holler_client"
+path = "src/lib.rs"
