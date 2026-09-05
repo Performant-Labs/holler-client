@@ -9,4 +9,5 @@ Circuit-wide decisions (talk plane, tokens, WebSocket, presence, **protocol v1**
 | ADR | Issue | Title |
 |-----|-------|--------|
 | 0001 | #2 | Speak Holler protocol v1; answer query locally |
-| 0002–0020 | #3–#21 | reserved |
+| 0002 | #3 | Bodies are config + ACP subprocess, not plugins |
+| 0003–0020 | #4–#21 | reserved |
