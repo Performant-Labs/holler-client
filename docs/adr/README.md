@@ -4,7 +4,7 @@
 
 Issue #1 is orientation. The v1 epic starts at #22.
 
-Circuit-wide decisions (talk plane, tokens, WebSocket, presence, **protocol v1**) live on [holler-server ADRs](https://github.com/Performant-Labs/holler-server/blob/main/docs/adr/README.md). Client ADRs are for this body only. **Language is Rust** (same as the server).
+Circuit-wide decisions (talk plane, tokens, WebSocket, presence, **protocol v1**) live on [holler-server ADRs](https://github.com/Performant-Labs/holler-server/blob/main/docs/adr/README.md). Client ADRs are for this body only. **Language is Rust** so we can use the official ACP SDK ([holler-server ADR 0013](https://github.com/Performant-Labs/holler-server/issues/14)).
 
 | ADR | Issue | Title |
 |-----|-------|--------|
