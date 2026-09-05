@@ -4,3 +4,4 @@
 //! implemented. This crate currently has no runtime behavior.
 
 pub mod config;
+pub mod debug;
