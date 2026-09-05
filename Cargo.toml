@@ -8,3 +8,7 @@ license = "Proprietary"
 [lib]
 name = "holler_client"
 path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
