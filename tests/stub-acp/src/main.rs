@@ -11,23 +11,42 @@
 //! `println!`, so the line terminator is exact and binary-safe on
 //! every platform, including Windows (`stub-acp.exe`).
 //!
-//! ACP v1 is not otherwise pinned in this repo yet, so this stub
-//! makes the following documented, made-up-but-reasonable choices:
+//! ACP v1 was not pinned in this repo when this stub was first written
+//! (issue #32), so its wire shapes were originally documented,
+//! made-up-but-reasonable guesses. Issue #26 pinned the real protocol
+//! (the `agent-client-protocol`/`agent-client-protocol-schema` crates)
+//! and found two of those guesses were not actually schema-conformant:
+//! the client-side handshake (`initialize`) was missing, and
+//! `session/update`'s payload didn't match the real, internally-tagged
+//! `SessionNotification`/`SessionUpdate` shape. The real crate's
+//! dispatcher matches `session/update` to `SessionNotification`
+//! unconditionally and silently drops it on a parse failure (there's no
+//! request `id` to error back on), so a non-conformant shape here is
+//! invisible to any client built on that crate, not just wrong. Both
+//! are now fixed to match the real schema, verified against the actual
+//! crate (see `src/acp_driver.rs`) rather than guessed:
 //!
+//! - `initialize` params: `{"protocolVersion": 1, ...}` (other fields
+//!   optional/defaulted per schema). Responds with
+//!   `{"protocolVersion": 1}` (a minimal `InitializeResponse`; the
+//!   other fields all default in the real schema).
 //! - `session/new` params: optional `{"sessionId": "alpha" | "beta" | ...}`.
 //!   If a name is given, it becomes the session id verbatim. If
 //!   omitted, sessions are auto-named `"alpha"`, then `"beta"`, then
 //!   `"session-2"`, `"session-3"`, ... The chosen id is returned as
 //!   `{"sessionId": ...}`.
-//! - `session/prompt` params: `{"sessionId": ..., "prompt": "..."}`.
+//! - `session/prompt` params: `{"sessionId": ..., "prompt": [...]}`.
 //!   Before replying to the request, the stub emits one
-//!   `session/update` notification with a fixed canned reply —
-//!   `{"sessionId": ..., "text": "PONG"}` — rather than echoing the
-//!   prompt text, so fixture assertions can compare against an exact
-//!   constant. It then responds to the request with
-//!   `{"stopReason": "end_turn"}`, or `{"stopReason": "cancelled"}`
-//!   if a `session/cancel` is still pending for this session (see
-//!   below).
+//!   `session/update` notification with a fixed canned reply — a
+//!   `SessionNotification` whose `update` is an
+//!   `AgentMessageChunk`/`ContentBlock::Text` carrying the constant
+//!   text `"PONG"` (`{"sessionId": ..., "update": {"sessionUpdate":
+//!   "agent_message_chunk", "content": {"type": "text", "text":
+//!   "PONG"}}}`) — rather than echoing the prompt text, so fixture
+//!   assertions can compare against an exact constant. It then
+//!   responds to the request with `{"stopReason": "end_turn"}`, or
+//!   `{"stopReason": "cancelled"}` if a `session/cancel` is still
+//!   pending for this session (see below).
 //! - `session/cancel` params: `{"sessionId": ...}`. May arrive as a
 //!   request (has `id`, gets a `{"sessionId": ..., "cancelled": true}`
 //!   response) or as a notification (no `id`, no response). Since
@@ -82,6 +101,11 @@ fn handle_message(msg: &Value, sessions: &mut HashMap<String, Session>, out: &mu
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
 
     match method {
+        "initialize" => {
+            if let Some(id) = request_id {
+                respond(out, id, json!({ "protocolVersion": 1 }));
+            }
+        }
         "session/new" => {
             let session_id = params
                 .get("sessionId")
@@ -107,7 +131,13 @@ fn handle_message(msg: &Value, sessions: &mut HashMap<String, Session>, out: &mu
             notify(
                 out,
                 "session/update",
-                json!({ "sessionId": session_id, "text": "PONG" }),
+                json!({
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": "PONG" },
+                    },
+                }),
             );
 
             let stop_reason = if cancelled { "cancelled" } else { "end_turn" };
@@ -125,7 +155,11 @@ fn handle_message(msg: &Value, sessions: &mut HashMap<String, Session>, out: &mu
                 s.cancel_pending = true;
             }
             if let Some(id) = request_id {
-                respond(out, id, json!({ "sessionId": session_id, "cancelled": true }));
+                respond(
+                    out,
+                    id,
+                    json!({ "sessionId": session_id, "cancelled": true }),
+                );
             }
         }
         other => {
@@ -149,7 +183,10 @@ fn next_auto_name(sessions: &HashMap<String, Session>) -> String {
 }
 
 fn respond(out: &mut impl Write, id: Value, result: Value) {
-    write_line(out, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+    write_line(
+        out,
+        &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+    );
 }
 
 fn respond_error(out: &mut impl Write, id: Value, code: i32, message: String) {
@@ -160,7 +197,10 @@ fn respond_error(out: &mut impl Write, id: Value, code: i32, message: String) {
 }
 
 fn notify(out: &mut impl Write, method: &str, params: Value) {
-    write_line(out, &json!({ "jsonrpc": "2.0", "method": method, "params": params }));
+    write_line(
+        out,
+        &json!({ "jsonrpc": "2.0", "method": method, "params": params }),
+    );
 }
 
 fn write_line(out: &mut impl Write, value: &Value) {

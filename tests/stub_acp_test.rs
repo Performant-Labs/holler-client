@@ -24,13 +24,19 @@ impl StubAcp {
             .expect("spawning stub-acp must not fail");
         let stdin = child.stdin.take().expect("child stdin was piped");
         let stdout = BufReader::new(child.stdout.take().expect("child stdout was piped"));
-        StubAcp { child, stdin, stdout }
+        StubAcp {
+            child,
+            stdin,
+            stdout,
+        }
     }
 
     fn send(&mut self, msg: &Value) {
         let mut line = serde_json::to_vec(msg).expect("request serializes");
         line.push(b'\n');
-        self.stdin.write_all(&line).expect("write to stub-acp stdin");
+        self.stdin
+            .write_all(&line)
+            .expect("write to stub-acp stdin");
         self.stdin.flush().expect("flush stub-acp stdin");
     }
 
@@ -75,7 +81,7 @@ fn session_new_prompt_cancel_prompt_again() {
     let update = stub.recv();
     assert_eq!(update["method"], "session/update");
     assert_eq!(update["params"]["sessionId"], "alpha");
-    assert_eq!(update["params"]["text"], "PONG");
+    assert_eq!(update["params"]["update"]["content"]["text"], "PONG");
     let prompt_reply = stub.recv();
     assert_eq!(prompt_reply["id"], 2);
     assert_eq!(prompt_reply["result"]["stopReason"], "end_turn");
@@ -101,7 +107,10 @@ fn session_new_prompt_cancel_prompt_again() {
     }));
     let update_after_cancel = stub.recv();
     assert_eq!(update_after_cancel["method"], "session/update");
-    assert_eq!(update_after_cancel["params"]["text"], "PONG");
+    assert_eq!(
+        update_after_cancel["params"]["update"]["content"]["text"],
+        "PONG"
+    );
     let prompt_after_cancel = stub.recv();
     assert_eq!(prompt_after_cancel["id"], 4);
     assert_eq!(prompt_after_cancel["result"]["stopReason"], "cancelled");
