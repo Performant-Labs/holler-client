@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 #
-# app:local:run — build and run the joined holler-client session, noisy by default.
+# app:local:run — build and run the joined holler-client session.
 #
 # Usage: ./scripts/local-run.sh
 #        HOLLER_CONFIG=custom.toml ./scripts/local-run.sh
+#        HOLLER_DEBUG=quiet ./scripts/local-run.sh
 #
 # Assumes `holler join` has already been run (if not, `holler run`'s own
-# error tells you the exact command to run first). Runs in the foreground
-# with --debug=noisy — the dev/test entry point, so full frame visibility
-# (secrets already redacted) is what you want here.
+# error tells you the exact command to run first). Runs in the foreground.
+# No --debug is passed here — the wrapper doesn't impose a verbosity
+# opinion; holler run's own default/HOLLER_DEBUG/--debug precedence
+# applies exactly as it would running the binary directly.
 #
 # Config file: $HOLLER_CONFIG if set, else session.toml or sessions.toml
 # (whichever exists — both names appear in this repo's own docs/examples).
@@ -29,4 +31,4 @@ else
 fi
 
 cargo build --release
-exec ./target/release/holler run --config "$config" --debug=noisy
+exec ./target/release/holler run --config "$config"

@@ -62,10 +62,10 @@ HOLLER_SERVER_HOST=io ./scripts/run app:local:tunnel
 |---|---|
 | `build` | `cargo build --release` — bare, per the convention's reserved lifecycle verbs (never namespaced) |
 | `app:local:tunnel` | Open the SSH tunnel to `$HOLLER_SERVER_HOST`'s loopback `holler-server serve` port (required until `wss` lands — see holler-server ADR 0004/0010); no-ops if something already owns the port |
-| `app:local:run` | Build, then `holler run --debug=noisy` in the foreground against `session.toml`/`sessions.toml` (or `$HOLLER_CONFIG`). Requires an existing `holler join` — its own error tells you the command if not |
+| `app:local:run` | Build, then `holler run` in the foreground against `session.toml`/`sessions.toml` (or `$HOLLER_CONFIG`). Requires an existing `holler join` — its own error tells you the command if not |
 | `app:local:stop` | `holler detach`, then close the tunnel from `app:local:tunnel` |
 
-Each maps to a same-named `scripts/local-*.sh` file if you'd rather call the script directly. `--debug=noisy` is the default for `app:local:run` deliberately — this is the dev/test entry point, and full frame visibility (secrets already redacted) is exactly what you want here.
+Each maps to a same-named `scripts/local-*.sh` file if you'd rather call the script directly. `app:local:run` passes no `--debug` of its own — `HOLLER_DEBUG`/`--debug` precedence works exactly as it would running the binary directly (see [Debug output](#debug-output) below); set `HOLLER_DEBUG=quiet` or `=noisy` in your shell before running it, or just call the binary yourself with `--debug=...` if you want it one-shot.
 
 ### Debug output
 
