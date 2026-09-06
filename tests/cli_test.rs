@@ -219,6 +219,9 @@ async fn join_then_status_then_detach_then_status() {
     assert!(!credential_contents.contains(secret));
     assert!(!credential_contents.contains(&token));
     assert!(credential_contents.contains("cli_integrationtest"));
+    // token_id (issue #47) must be persisted too — it's what `holler run`
+    // needs to send as `auth`'s `from`, not `client_id`.
+    assert!(credential_contents.contains("tok_integration"));
 
     // detach deletes the credential
     let detach_out = env.cmd().arg("detach").output().unwrap();
