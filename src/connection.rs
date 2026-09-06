@@ -8,17 +8,15 @@
 //! `holler-server` ADR 0003, `docs/protocol/v1.md` §4: "Reconnect uses
 //! the credential again."). It never sends a join token.
 //!
-//! **It is not, and cannot yet be, the real implementation behind
-//! `holler join`'s redeem step.** `docs/protocol/v1.md`'s 12 message
-//! types have no dedicated redeem/join frame, and the live `auth` handler
-//! on `holler-server` (issue #31, `src/wire/connection.rs`) only calls
-//! `TokenStore::verify_credential` — never a `redeem`. There is currently
-//! **no wire mechanism at all** for a one-time join token to become a
-//! credential over the network. That gap belongs to [`crate::join`]
-//! (see its module doc and [`crate::join::StubJoinTransport`]); this
-//! module does not attempt to paper over it by inventing one, and a new
-//! wire message type for redeem is a protocol-level decision for the
-//! team, not something to add unilaterally from the client side.
+//! It is not the real implementation behind `holler join`'s redeem step
+//! — that's [`crate::join`]. The redeem gap this module used to describe
+//! (no wire frame for turning a join token into a credential) is now
+//! closed at the protocol level: `holler-server` ADR 0015 adds a
+//! dedicated `join`/`join_ok` frame pair (`docs/protocol/v1.md` §4.1),
+//! and the implementation on both sides is in flight (or done — check
+//! `crate::join`'s own module doc for current status). This module still
+//! doesn't send a join token itself; it only resumes with an
+//! already-persisted credential, same as before.
 //!
 //! # This client also has no `token_id`, only a `client_id`
 //!
@@ -34,13 +32,19 @@
 //!
 //! # Heartbeat and backoff numbers
 //!
-//! No dropped-connections research memo exists yet: `research/dropped-connections`
-//! in the `holler-server` repo is, as of this story, an unpublished
-//! branch pointer identical to `main` (no memo content was ever pushed
-//! to it). [`HEARTBEAT_INTERVAL`] and the backoff schedule in
-//! [`backoff_with_full_jitter`] are therefore this story's own judgment
-//! call — reasonable, well-known industry defaults, not a measured
-//! recommendation. Revisit both if that memo lands later.
+//! [`HEARTBEAT_INTERVAL`] is 15s, matching `holler-server`'s
+//! `research/dropped-connections` memo (`docs/research-dropped-connections.md`):
+//! "3 missed heartbeats = dead" is a near-universal convention (SSH's
+//! `ClientAliveCountMax`/`ServerAliveCountMax` default, Buzz's own
+//! `SLOW_CLIENT_GRACE_LIMIT`), which is why [`STALE_AFTER`] derives as
+//! `HEARTBEAT_INTERVAL * 3` (45s) — the same threshold
+//! `holler-server`'s roster (issue #32) uses to move a session from
+//! `connected` to `reconnecting`. This was originally guessed at 20s
+//! before the memo was found; fixed to avoid a healthy client flapping
+//! into `reconnecting` on the server's roster between heartbeats. The
+//! backoff schedule in [`backoff_with_full_jitter`] (base 1s, cap 30s,
+//! full jitter) is the same memo's recommendation, grounded in AWS's
+//! well-known "Exponential Backoff and Jitter" post.
 //!
 //! # Live state is file-based, not a control socket
 //!
@@ -76,9 +80,17 @@ use crate::query;
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// How often this client sends its own `ping` (and the window it gives
-/// the server to `pong` back before declaring the connection dead — see
-/// module docs on why there's no separate memo-backed number yet).
-pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+/// the server to `pong` back before declaring the connection dead).
+/// 15s to match holler-server's roster/presence TTL (issue #32), which
+/// assumes 3 missed heartbeats at this interval = 45s before marking a
+/// session `reconnecting` (`research/dropped-connections`,
+/// docs/research-dropped-connections.md: "3 missed = dead" is a
+/// near-universal convention — SSH's ClientAliveCountMax/
+/// ServerAliveCountMax default, Buzz's own SLOW_CLIENT_GRACE_LIMIT).
+/// This value was originally guessed at 20s before that research memo
+/// was found; fixed here so a healthy client doesn't flap into
+/// "reconnecting" on the server's roster between heartbeats.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// Exponential-backoff base delay (first retry is `random(0, BASE)`).
 pub const BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// Backoff never waits longer than this between reconnect attempts.
