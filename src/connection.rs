@@ -538,6 +538,12 @@ async fn send_reply_chunks(
         return true;
     }
     let coalesced = chunks.len();
+    // The actual reply content — the reason a human is watching this log
+    // at all. Joined before the wire-shape split below consumes `chunks`,
+    // so it reflects this frame's text regardless of which wire field
+    // ends up carrying it. Never a secret, so it belongs at `quiet`, not
+    // locked behind `noisy`'s full frame dump.
+    let preview = chunks.join("");
     // A batch of one keeps the pre-coalescing wire shape exactly: `text`
     // set, `chunks` empty. Only a genuine batch uses `chunks`, so the
     // common short-reply case is byte-identical to before and stays
@@ -551,14 +557,16 @@ async fn send_reply_chunks(
     let Ok(raw) = proto::encode(&reply) else {
         return true;
     };
-    debug::outgoing(cfg, "reply")
+    let mut outbound = debug::outgoing(cfg, "reply")
         .id(reply_id)
         .peer(client_id)
         .field("session", session)
         .field("chunks", coalesced.to_string())
-        .field("done", done.to_string())
-        .frame(|| raw.clone())
-        .emit();
+        .field("done", done.to_string());
+    if !preview.is_empty() {
+        outbound = outbound.field("text", preview);
+    }
+    outbound.frame(|| raw.clone()).emit();
     ws.send(Message::Text(raw.into())).await.is_ok()
 }
 
@@ -619,11 +627,21 @@ async fn session_loop(
                             // stricter once it exists.
                             continue;
                         };
-                        debug::incoming(cfg, envelope.msg_type.as_wire_str())
+                        // A prompt's text is the whole reason this frame
+                        // exists, not incidental metadata — surface it at
+                        // `quiet`, not only inside the `noisy` frame dump.
+                        // Read before the match below moves `envelope.body`.
+                        let prompt_preview = match &envelope.body {
+                            Body::Prompt(PromptBody { text, .. }) => Some(text.as_str()),
+                            _ => None,
+                        };
+                        let mut inbound = debug::incoming(cfg, envelope.msg_type.as_wire_str())
                             .id(&envelope.id)
-                            .peer(&envelope.from)
-                            .frame(|| text.to_string())
-                            .emit();
+                            .peer(&envelope.from);
+                        if let Some(t) = prompt_preview {
+                            inbound = inbound.field("text", t);
+                        }
+                        inbound.frame(|| text.to_string()).emit();
                         match envelope.body {
                             Body::Ping(_) => {
                                 let pong = proto::pong_reply(&envelope.id, client_id, hostname);
