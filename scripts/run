@@ -13,6 +13,9 @@ dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cmd="${1:-}"
 
 case "$cmd" in
+  # Bare lifecycle verb (playbook convention: build/dev/start/test/... stay
+  # unnamespaced) — cargo build --release, standalone.
+  build)             cd "$dir/.." && exec cargo build --release ;;
   app:local:tunnel)  exec "$dir/local-tunnel.sh" ;;
   app:local:run)     exec "$dir/local-run.sh" ;;
   app:local:stop)    exec "$dir/local-stop.sh" ;;
@@ -20,7 +23,7 @@ case "$cmd" in
     echo "usage: ./scripts/run <command>" >&2
     ;&
   *)
-    echo "known commands: app:local:tunnel  app:local:run  app:local:stop" >&2
+    echo "known commands: build  app:local:tunnel  app:local:run  app:local:stop" >&2
     exit 1
     ;;
 esac

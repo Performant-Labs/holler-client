@@ -12,6 +12,7 @@ pub mod instance_lock;
 pub mod join;
 pub mod proto;
 pub mod query;
+pub mod reply_coalescer;
 pub mod server_address;
 pub mod session_manager;
 pub mod status;
