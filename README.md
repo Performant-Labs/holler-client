@@ -66,4 +66,3 @@ License is `Proprietary` (see `Cargo.toml`) — this isn't an open-contribution 
 ## Companion repo
 
 [holler-server](https://github.com/Performant-Labs/holler-server) — the hub half of the circuit: mints join tokens, hosts the roster, and routes `say`/`interrupt` to whichever client currently owns a session.
-</content>

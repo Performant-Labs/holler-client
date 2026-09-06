@@ -13,4 +13,3 @@ pre-decision history.
 Nothing yet — this file is created ahead of the first tagged release; see
 [issue #54](https://github.com/Performant-Labs/holler-client/issues/54) for the release
 process this project hasn't cut a release with yet.
-</content>
