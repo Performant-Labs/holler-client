@@ -4,92 +4,57 @@
 //! directly, so a real process invocation is the only thing that
 //! actually proves it.
 
-use std::process::Command;
+use assert_cmd::Command;
+use predicates::prelude::*;
+use rstest::rstest;
 
 fn holler() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_holler"))
+    Command::cargo_bin("holler").expect("holler binary not built")
 }
 
 /// hlrclnt-1000: `--version` and `-V` report the crate's real version.
-#[test]
-fn version_flag_prints_crate_version() {
-    let expected = format!("holler {}\n", env!("CARGO_PKG_VERSION"));
-
-    for flag in ["--version", "-V"] {
-        let out = holler().arg(flag).output().expect("failed to run holler");
-        assert!(out.status.success(), "`{flag}` should exit 0");
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout),
-            expected,
-            "`{flag}` stdout should be exactly `holler <version>`"
-        );
-    }
+#[rstest]
+#[case("--version")]
+#[case("-V")]
+fn version_flag_prints_crate_version(#[case] flag: &str) {
+    holler()
+        .arg(flag)
+        .assert()
+        .success()
+        .stdout(format!("holler {}\n", env!("CARGO_PKG_VERSION")));
 }
 
 /// hlrclnt-1001: `--help` prints the full subcommand list to stdout and
 /// exits 0.
 #[test]
 fn help_flag_prints_full_usage() {
-    let out = holler().arg("--help").output().expect("failed to run holler");
-    assert!(out.status.success(), "`--help` should exit 0");
+    let assert = holler().arg("--help").assert().success().stderr(predicate::str::is_empty());
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    for subcommand in ["join", "run", "detach", "status", "support", "caps", "query"] {
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    for needle in ["join", "run", "detach", "status", "support", "caps", "query", "--config", "--debug"] {
         assert!(
-            stdout.contains(subcommand),
-            "--help output should list `{subcommand}`, got:\n{stdout}"
+            stdout.contains(needle),
+            "--help output should list `{needle}`, got:\n{stdout}"
         );
     }
-    for global_opt in ["--config", "--debug"] {
-        assert!(
-            stdout.contains(global_opt),
-            "--help output should list the global `{global_opt}` option, got:\n{stdout}"
-        );
-    }
-    assert!(
-        String::from_utf8_lossy(&out.stderr).is_empty(),
-        "--help should not write to stderr"
-    );
 }
 
-/// hlrclnt-1002: an invocation with no subcommand, or an unrecognized
-/// one, fails closed -- usage/error text on stderr (never stdout),
-/// non-zero exit -- rather than silently doing something or hanging.
-#[test]
-fn bare_and_unknown_subcommand_fail_closed() {
-    let bare = holler().output().expect("failed to run holler");
-    assert!(!bare.status.success(), "bare invocation must not exit 0");
-    assert_eq!(
-        bare.status.code(),
-        Some(2),
-        "bare invocation should exit with clap's usage-error code 2"
-    );
-    assert!(
-        bare.stdout.is_empty(),
-        "bare invocation must not print to stdout"
-    );
-    assert!(
-        String::from_utf8_lossy(&bare.stderr).contains("Usage: holler"),
-        "bare invocation's stderr should show usage"
-    );
+/// hlrclnt-1002: an invocation with no subcommand, or an unrecognized one,
+/// fails closed -- usage/error text on stderr only, exit code 2 -- rather
+/// than silently doing something, printing to stdout, or hanging.
+#[rstest]
+#[case::bare(&[][..], &["Usage: holler"])]
+#[case::unknown_subcommand(&["bogus"][..], &["unrecognized subcommand", "bogus"])]
+fn bare_and_unknown_subcommand_fail_closed(#[case] args: &[&str], #[case] expect_stderr_contains: &[&str]) {
+    let assert = holler()
+        .args(args)
+        .assert()
+        .failure()
+        .code(2)
+        .stdout(predicate::str::is_empty());
 
-    let unknown = holler()
-        .arg("bogus")
-        .output()
-        .expect("failed to run holler");
-    assert!(!unknown.status.success(), "an unknown subcommand must not exit 0");
-    assert_eq!(
-        unknown.status.code(),
-        Some(2),
-        "an unknown subcommand should exit with clap's usage-error code 2"
-    );
-    assert!(
-        unknown.stdout.is_empty(),
-        "an unknown subcommand must not print to stdout"
-    );
-    let unknown_stderr = String::from_utf8_lossy(&unknown.stderr);
-    assert!(
-        unknown_stderr.contains("unrecognized subcommand") && unknown_stderr.contains("bogus"),
-        "an unknown subcommand's stderr should name it, got:\n{unknown_stderr}"
-    );
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    for needle in expect_stderr_contains {
+        assert!(stderr.contains(needle), "expected stderr to contain `{needle}`, got:\n{stderr}");
+    }
 }
