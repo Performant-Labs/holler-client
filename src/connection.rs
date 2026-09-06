@@ -59,6 +59,7 @@
 //! reverse: it drops a marker file that the live `run` process polls for
 //! and, on seeing it, closes its socket and exits.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -67,13 +68,26 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::config::SessionRegistry;
+use crate::acp_driver::{DriverEvent, DriverStatus};
+use crate::config::{SessionConfig, SessionRegistry};
 use crate::credential::{resolve_state_dir, CredentialError, STATE_DIR_ENV};
-use crate::proto::{self, Body, ErrorBody, CODE_UNAUTHENTICATED};
+use crate::proto::{
+    self, Body, ErrorBody, InterruptBody, PromptBody, CODE_SESSION_UNAVAILABLE,
+    CODE_UNAUTHENTICATED, CODE_UNKNOWN_SESSION,
+};
 use crate::query;
+use crate::session_manager::{ManagerError, SessionManager};
+use crate::status::SessionStatus;
+
+/// Every session's event-forwarding channel, keyed by session name —
+/// see [`SessionManager::take_event_channels`] for why the wire layer
+/// owns these directly rather than going through
+/// [`SessionManager::next_event`].
+pub type EventChannels = HashMap<String, mpsc::UnboundedReceiver<DriverEvent>>;
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -288,11 +302,57 @@ impl std::fmt::Display for ConnectError {
 
 impl std::error::Error for ConnectError {}
 
+/// Sessions whose harness is confirmed runnable right now (ADR-0001:
+/// "advertise only what is real") — the one filter `hello`'s `sessions`
+/// list and `presence`'s session rows both apply.
+fn confirmed_sessions<'a>(
+    registry: &'a SessionRegistry,
+    confirmed: &[String],
+) -> Vec<&'a SessionConfig> {
+    registry
+        .sessions()
+        .iter()
+        .filter(|s| confirmed.contains(&s.harness))
+        .collect()
+}
+
+/// Builds this connection's `presence` session rows (issue #49): one
+/// `{name, harness, busy}` row — the same shape `holler status` reports
+/// ([`SessionStatus`]) — per confirmed session, `busy` read live from
+/// `manager` when one is running. A session with no live
+/// [`SessionManager`] entry (spawning it failed; see
+/// `crate::main`/`run_run`) reports `busy: false` — hello's own sessions
+/// list already only advertises this same confirmed set, so this never
+/// claims a session is real when nothing backs it.
+async fn build_presence_sessions(
+    registry: &SessionRegistry,
+    confirmed: &[String],
+    manager: Option<&SessionManager>,
+) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    for session in confirmed_sessions(registry, confirmed) {
+        let busy = match manager {
+            Some(m) => m.is_busy(&session.name).await.unwrap_or(false),
+            None => false,
+        };
+        let status = SessionStatus {
+            name: session.name.clone(),
+            harness: session.harness.clone(),
+            busy,
+        };
+        rows.push(serde_json::to_value(status).expect("SessionStatus always serializes"));
+    }
+    rows
+}
+
 /// Dials `server_url`, sends `auth` with the persisted credential, and
 /// waits for the server's `hello` (spec §4: `connect -> auth -> hello
-/// (both ways)`). Sends this client's own `hello` once the server's has
-/// arrived. Never sends or logs the credential in the clear beyond this
-/// one `auth` frame.
+/// (both ways)`). Sends this client's own `hello`, then a `presence`
+/// frame (issue #49; holler-server issue #52: every (re)connect
+/// re-advertises a complete, fresh session list — never assumes the
+/// server remembers anything from before a drop) once the server's hello
+/// has arrived. Never sends or logs the credential in the clear beyond
+/// this one `auth` frame.
 async fn connect_and_auth(
     server_url: &str,
     credential: &str,
@@ -300,6 +360,7 @@ async fn connect_and_auth(
     client_id: &str,
     hostname: &str,
     registry: &SessionRegistry,
+    session_manager: Option<&SessionManager>,
 ) -> Result<WsStream, ConnectError> {
     let (mut ws, _response) = tokio_tungstenite::connect_async(server_url)
         .await
@@ -355,21 +416,36 @@ async fn connect_and_auth(
     // "Advertise only what is real" (ADR-0001): only genuinely-confirmed
     // runnable harnesses, and only sessions whose harness is one of them.
     let confirmed = registry.confirmed_harnesses();
-    let sessions = registry
-        .sessions()
-        .iter()
-        .filter(|s| confirmed.contains(&s.harness))
+    let sessions = confirmed_sessions(registry, &confirmed)
+        .into_iter()
         .map(|s| proto::HelloSession {
             name: s.name.clone(),
             harness: s.harness.clone(),
         })
         .collect();
-    let features = query::CLIENT_FEATURES.iter().map(|s| s.to_string()).collect();
-    let hello = proto::client_hello(client_id, hostname, client_id, features, confirmed, sessions);
+    let features = query::CLIENT_FEATURES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let hello = proto::client_hello(
+        client_id,
+        hostname,
+        client_id,
+        features,
+        confirmed.clone(),
+        sessions,
+    );
     let raw = proto::encode(&hello).expect("v1 hello envelope always serializes");
     ws.send(Message::Text(raw.into()))
         .await
         .map_err(|e| ConnectError::Transport(format!("failed to send client hello: {e}")))?;
+
+    let presence_rows = build_presence_sessions(registry, &confirmed, session_manager).await;
+    let presence = proto::client_presence(client_id, presence_rows);
+    let raw = proto::encode(&presence).expect("v1 presence envelope always serializes");
+    ws.send(Message::Text(raw.into()))
+        .await
+        .map_err(|e| ConnectError::Transport(format!("failed to send client presence: {e}")))?;
 
     Ok(ws)
 }
@@ -384,16 +460,48 @@ enum LoopExit {
     Dropped(String),
 }
 
+/// Waits for the next [`DriverEvent`] from *any* session in `channels`,
+/// tagged with that session's name. `channels` holds the raw receivers
+/// [`SessionManager::take_event_channels`] handed over — see that
+/// method's docs for why polling them directly here (rather than through
+/// [`SessionManager::next_event`]) is what lets an idle session's events
+/// never block another session's prompt/interrupt handling.
+///
+/// Never resolves if `channels` is empty (nothing to ever produce an
+/// event) — callers select! this alongside other branches, so that's
+/// exactly "this branch never wins," not a hang.
+async fn recv_any_event(channels: &mut EventChannels) -> Option<(String, DriverEvent)> {
+    if channels.is_empty() {
+        return std::future::pending().await;
+    }
+    std::future::poll_fn(|cx| {
+        for (name, rx) in channels.iter_mut() {
+            if let std::task::Poll::Ready(Some(event)) = rx.poll_recv(cx) {
+                return std::task::Poll::Ready(Some((name.clone(), event)));
+            }
+            // Pending, or this session's channel closed for good: keep
+            // checking the others rather than resolving `None` for the
+            // whole batch.
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
 /// Services one live connection: answers `ping` with `pong` (including
 /// hostname, per the issue), sends this client's own heartbeat `ping` on
-/// [`HEARTBEAT_INTERVAL`], and polls for a detach request. Returns when
-/// the connection ends for any reason.
+/// [`heartbeat_interval`], polls for a detach request, and (issue #49)
+/// dispatches inbound `prompt`/`interrupt` to `session_manager` while
+/// streaming its `reply`/`ack` frames back out. Returns when the
+/// connection ends for any reason.
 async fn session_loop(
     mut ws: WsStream,
     client_id: &str,
     hostname: &str,
     registry: &SessionRegistry,
     state: &ConnectionStateStore,
+    session_manager: Option<&SessionManager>,
+    event_channels: &mut EventChannels,
 ) -> LoopExit {
     state.mark_connected();
 
@@ -405,6 +513,14 @@ async fn session_loop(
     detach_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut awaiting_pong = false;
+    // The envelope `id` of the most recent `prompt` dispatched to each
+    // session, so this session's streamed `reply` frames can reuse the
+    // request id (spec §3: "Replies reuse the request id"). Scoped to
+    // this one connection — a turn that outlives a reconnect loses this
+    // correlation, which is consistent with holler-server issue #52's
+    // "ask again" contract (nothing about a pre-drop turn's identity is
+    // assumed to survive the drop).
+    let mut last_prompt_id: HashMap<String, String> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -461,9 +577,78 @@ async fn session_loop(
                                     return LoopExit::Dropped("failed to send query reply".to_string());
                                 }
                             }
-                            // `hello` / anything not yet implemented
-                            // (prompt routing is a later story): nothing
-                            // to act on today.
+                            Body::Prompt(PromptBody { session, text, .. }) => {
+                                let reply = match session_manager {
+                                    Some(manager) => match manager.prompt(&session, text) {
+                                        Ok(()) => {
+                                            last_prompt_id.insert(session.clone(), envelope.id.clone());
+                                            None
+                                        }
+                                        Err(ManagerError::UnknownSession(_)) => Some(proto::error_reply(
+                                            &envelope.id,
+                                            client_id,
+                                            CODE_UNKNOWN_SESSION,
+                                            None,
+                                            &format!("no such session: {session}"),
+                                        )),
+                                        Err(other) => Some(proto::error_reply(
+                                            &envelope.id,
+                                            client_id,
+                                            CODE_SESSION_UNAVAILABLE,
+                                            None,
+                                            &other.to_string(),
+                                        )),
+                                    },
+                                    None => Some(proto::error_reply(
+                                        &envelope.id,
+                                        client_id,
+                                        CODE_UNKNOWN_SESSION,
+                                        None,
+                                        &format!("no such session: {session}"),
+                                    )),
+                                };
+                                if let Some(reply) = reply {
+                                    let Ok(raw) = proto::encode(&reply) else { continue };
+                                    if ws.send(Message::Text(raw.into())).await.is_err() {
+                                        return LoopExit::Dropped("failed to send prompt error reply".to_string());
+                                    }
+                                }
+                            }
+                            Body::Interrupt(InterruptBody { session }) => {
+                                let reply = match session_manager {
+                                    Some(manager) => match manager.interrupt(&session).await {
+                                        Ok(_outcome) => proto::ack_reply(&envelope.id, client_id),
+                                        Err(ManagerError::UnknownSession(_)) => proto::error_reply(
+                                            &envelope.id,
+                                            client_id,
+                                            CODE_UNKNOWN_SESSION,
+                                            None,
+                                            &format!("no such session: {session}"),
+                                        ),
+                                        Err(other) => proto::error_reply(
+                                            &envelope.id,
+                                            client_id,
+                                            CODE_SESSION_UNAVAILABLE,
+                                            None,
+                                            &other.to_string(),
+                                        ),
+                                    },
+                                    None => proto::error_reply(
+                                        &envelope.id,
+                                        client_id,
+                                        CODE_UNKNOWN_SESSION,
+                                        None,
+                                        &format!("no such session: {session}"),
+                                    ),
+                                };
+                                let Ok(raw) = proto::encode(&reply) else { continue };
+                                if ws.send(Message::Text(raw.into())).await.is_err() {
+                                    return LoopExit::Dropped("failed to send interrupt reply".to_string());
+                                }
+                            }
+                            // `hello`/`presence`/`reply`/`ack`/anything
+                            // else: nothing this client acts on when it
+                            // arrives inbound.
                             _ => {}
                         }
                     }
@@ -519,6 +704,38 @@ async fn session_loop(
                     return LoopExit::Detached;
                 }
             }
+            tagged = recv_any_event(event_channels) => {
+                let Some((name, event)) = tagged else { continue };
+                // Reuse the id of the `prompt` that started this turn
+                // (spec §3); a session that somehow never had one
+                // (e.g. a turn already in flight before this connection
+                // — not something a fresh `holler run` can produce
+                // today) still gets a well-formed, if uncorrelated, id.
+                let reply_id = last_prompt_id
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(proto::new_id);
+                let reply = match event {
+                    DriverEvent::Update(text) => {
+                        Some(proto::reply(&reply_id, client_id, &name, Some(text), vec![], false))
+                    }
+                    DriverEvent::StopReason(_) => {
+                        last_prompt_id.remove(&name);
+                        Some(proto::reply(&reply_id, client_id, &name, None, vec![], true))
+                    }
+                    // Presence/busy tracking is answered by the
+                    // `presence` frame at (re)connect time, not streamed
+                    // mid-turn — see module docs on issue #52's
+                    // "ask again" contract.
+                    DriverEvent::Status(DriverStatus::Working | DriverStatus::Idle | DriverStatus::Blocked) => None,
+                };
+                if let Some(reply) = reply {
+                    let Ok(raw) = proto::encode(&reply) else { continue };
+                    if ws.send(Message::Text(raw.into())).await.is_err() {
+                        return LoopExit::Dropped("failed to send reply".to_string());
+                    }
+                }
+            }
         }
     }
 }
@@ -567,6 +784,11 @@ async fn sleep_or_detach(delay: Duration, state: &ConnectionStateStore) -> bool 
 /// a detach is requested (`Ok(())`) or the credential is rejected
 /// (`Err(ConnectError::Unauthenticated)`). Never returns `Err` for a
 /// merely transient failure — those are retried internally.
+// This is the one public entry point threading together everything a live
+// connection needs (identity, target, local session state); splitting it
+// into a config struct for a single-caller function would add a layer of
+// indirection without a second call site to justify it.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     server_url: &str,
     credential: &str,
@@ -575,6 +797,8 @@ pub async fn run(
     hostname: &str,
     registry: &SessionRegistry,
     state: &ConnectionStateStore,
+    session_manager: Option<&SessionManager>,
+    event_channels: &mut EventChannels,
 ) -> Result<(), ConnectError> {
     let mut attempt: u32 = 0;
 
@@ -587,13 +811,29 @@ pub async fn run(
 
         state.mark_connecting(attempt > 0);
         match connect_and_auth(
-            server_url, credential, token_id, client_id, hostname, registry,
+            server_url,
+            credential,
+            token_id,
+            client_id,
+            hostname,
+            registry,
+            session_manager,
         )
         .await
         {
             Ok(ws) => {
                 attempt = 0; // a successful handshake resets the backoff schedule
-                match session_loop(ws, client_id, hostname, registry, state).await {
+                match session_loop(
+                    ws,
+                    client_id,
+                    hostname,
+                    registry,
+                    state,
+                    session_manager,
+                    event_channels,
+                )
+                .await
+                {
                     LoopExit::Detached => {
                         state.clear_detach_request();
                         state.clear();
@@ -690,7 +930,10 @@ mod tests {
         let store = ConnectionStateStore::at_dir(dir.path().to_path_buf());
         store.mark_connected();
         // Zero max_age: the just-written timestamp is immediately "too old".
-        assert_eq!(store.current_state(Duration::from_secs(0)), LiveState::Disconnected);
+        assert_eq!(
+            store.current_state(Duration::from_secs(0)),
+            LiveState::Disconnected
+        );
     }
 
     #[test]

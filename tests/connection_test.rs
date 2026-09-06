@@ -93,6 +93,36 @@ command = ["opencode", "acp"]
         self
     }
 
+    /// Rewrites this env's config so both configured sessions
+    /// (`test-alpha`/`test-beta`) use the real `stub-acp` binary
+    /// (issue #32) instead of the fake `opencode` script — needed for
+    /// any test that actually dispatches a `prompt`/`interrupt`, since
+    /// `SessionManager::spawn` performs a real ACP `initialize` +
+    /// `session/new` handshake the fake script (which just exits) can't
+    /// answer. `stub-acp`'s path is absolute, so it's confirmed runnable
+    /// with no `$PATH` setup needed (unlike `with_fake_executable`).
+    fn with_stub_acp_sessions(self) -> Self {
+        let stub_acp = env!("CARGO_BIN_EXE_stub-acp");
+        std::fs::write(
+            &self.config_path,
+            format!(
+                r#"
+[[session]]
+name = "test-alpha"
+harness = "stub-acp"
+command = ["{stub_acp}"]
+
+[[session]]
+name = "test-beta"
+harness = "stub-acp"
+command = ["{stub_acp}"]
+"#
+            ),
+        )
+        .unwrap();
+        self
+    }
+
     fn cmd(&self) -> Command {
         let mut cmd = holler();
         cmd.env("HOLLER_STATE_DIR", self.dir.path());
@@ -315,6 +345,34 @@ fn query_envelope(cmd: &str, args: Vec<String>) -> proto::Envelope {
     }
 }
 
+fn prompt_envelope(session: &str, text: &str) -> proto::Envelope {
+    proto::Envelope {
+        v: 1,
+        msg_type: proto::MessageType::Prompt,
+        id: proto::new_id(),
+        ts: "2026-01-01T00:00:00Z".to_string(),
+        from: "server".to_string(),
+        body: Body::Prompt(proto::PromptBody {
+            session: session.to_string(),
+            text: text.to_string(),
+            meta: None,
+        }),
+    }
+}
+
+fn interrupt_envelope(session: &str) -> proto::Envelope {
+    proto::Envelope {
+        v: 1,
+        msg_type: proto::MessageType::Interrupt,
+        id: proto::new_id(),
+        ts: "2026-01-01T00:00:00Z".to_string(),
+        from: "server".to_string(),
+        body: Body::Interrupt(proto::InterruptBody {
+            session: session.to_string(),
+        }),
+    }
+}
+
 fn unauthenticated_error_envelope() -> proto::Envelope {
     proto::Envelope {
         v: 1,
@@ -379,6 +437,9 @@ async fn ping_from_server_is_answered_with_pong_including_hostname() {
     next_envelope(&mut ws)
         .await
         .expect("expected client `hello`"); // drain it
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`"); // drain it
 
     send_envelope(&mut ws, &ping_envelope()).await;
     let reply = next_envelope(&mut ws)
@@ -492,6 +553,9 @@ async fn detach_closes_a_live_connection_and_the_run_process_exits() {
     next_envelope(&mut ws)
         .await
         .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
 
     env.wait_for_status(STATUS_BUDGET, |doc| doc["connected"] == true);
 
@@ -543,6 +607,9 @@ async fn detach_still_works_after_the_connection_has_outlived_one_stale_window()
     next_envelope(&mut ws)
         .await
         .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
 
     // With a 2s heartbeat, this client will send its own `ping` every 2s
     // and consider the connection dead if a `pong` doesn't come back
@@ -611,6 +678,9 @@ async fn query_status_from_server_is_answered_with_the_real_status_document() {
     next_envelope(&mut ws)
         .await
         .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
 
     let request = query_envelope("status", vec![]);
     send_envelope(&mut ws, &request).await;
@@ -652,6 +722,9 @@ async fn query_support_reports_true_for_an_implemented_protocol_feature() {
     next_envelope(&mut ws)
         .await
         .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
 
     send_envelope(
         &mut ws,
@@ -693,6 +766,9 @@ async fn query_support_reports_true_for_confirmed_runnable_harness() {
     next_envelope(&mut ws)
         .await
         .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
 
     send_envelope(
         &mut ws,
@@ -737,6 +813,9 @@ async fn query_support_reports_false_for_a_harness_not_on_path() {
     next_envelope(&mut ws)
         .await
         .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
 
     send_envelope(
         &mut ws,
@@ -778,6 +857,9 @@ async fn query_caps_reports_a_capability_entry_for_every_known_id() {
     next_envelope(&mut ws)
         .await
         .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
 
     send_envelope(&mut ws, &query_envelope("caps", vec![])).await;
     let reply = next_envelope(&mut ws)
@@ -816,6 +898,9 @@ async fn query_protocol_with_no_args_reports_this_binarys_min_max() {
     next_envelope(&mut ws)
         .await
         .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
 
     send_envelope(&mut ws, &query_envelope("protocol", vec![])).await;
     let reply = next_envelope(&mut ws)
@@ -854,6 +939,9 @@ async fn query_protocol_with_arg_answers_can_you_speak_n() {
     next_envelope(&mut ws)
         .await
         .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
 
     send_envelope(&mut ws, &query_envelope("protocol", vec!["2".to_string()])).await;
     let reply = next_envelope(&mut ws)
@@ -891,6 +979,9 @@ async fn query_unknown_cmd_fails_closed_with_error_reply() {
     next_envelope(&mut ws)
         .await
         .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
 
     let request = query_envelope("summarize", vec![]);
     send_envelope(&mut ws, &request).await;
@@ -977,6 +1068,251 @@ async fn hello_advertises_no_harness_when_not_confirmed_runnable() {
         }
         other => panic!("expected `hello`, got {other:?}"),
     }
+
+    kill(child);
+}
+
+// --- Presence, prompt dispatch, interrupt dispatch (issue #49) ------------
+
+#[tokio::test]
+async fn presence_advertises_confirmed_sessions_with_busy_state() {
+    let env = Env::new().with_stub_acp_sessions();
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "tok_p1", "cli_p1", "presence-host");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws, "tok_p1").await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
+    let presence = next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
+    match presence.body {
+        Body::Presence(proto::PresenceBody { sessions }) => {
+            assert_eq!(sessions.len(), 2);
+            for row in &sessions {
+                assert_eq!(row["busy"], false);
+                assert!(row["name"].as_str().unwrap().starts_with("test-"));
+                assert_eq!(row["harness"], "stub-acp");
+            }
+        }
+        other => panic!("expected Presence, got {other:?}"),
+    }
+
+    kill(child);
+}
+
+#[tokio::test]
+async fn prompt_dispatches_to_session_and_streams_reply_then_done() {
+    let env = Env::new().with_stub_acp_sessions();
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "tok_p2", "cli_p2", "prompt-host");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws, "tok_p2").await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
+
+    let request = prompt_envelope("test-alpha", "hello");
+    send_envelope(&mut ws, &request).await;
+
+    // stub-acp answers with one "PONG" update chunk, then ends the turn.
+    let update = next_envelope(&mut ws)
+        .await
+        .expect("expected a `reply` chunk");
+    assert_eq!(update.id, request.id, "reply must reuse the prompt's id");
+    match update.body {
+        Body::Reply(proto::ReplyBody {
+            session,
+            text,
+            done,
+            ..
+        }) => {
+            assert_eq!(session, "test-alpha");
+            assert_eq!(text.as_deref(), Some("PONG"));
+            assert!(!done);
+        }
+        other => panic!("expected Reply, got {other:?}"),
+    }
+
+    let done_reply = next_envelope(&mut ws)
+        .await
+        .expect("expected the final `reply` with done: true");
+    assert_eq!(done_reply.id, request.id);
+    match done_reply.body {
+        Body::Reply(proto::ReplyBody { session, done, .. }) => {
+            assert_eq!(session, "test-alpha");
+            assert!(done);
+        }
+        other => panic!("expected Reply, got {other:?}"),
+    }
+
+    kill(child);
+}
+
+#[tokio::test]
+async fn prompt_to_unknown_session_errors_not_silently_dropped() {
+    let env = Env::new().with_stub_acp_sessions();
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "tok_p3", "cli_p3", "prompt-host2");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws, "tok_p3").await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
+
+    let request = prompt_envelope("no-such-session", "hi");
+    send_envelope(&mut ws, &request).await;
+    let reply = next_envelope(&mut ws)
+        .await
+        .expect("expected an `error` reply");
+    assert_eq!(reply.id, request.id);
+    match reply.body {
+        Body::Error(ErrorBody { code, .. }) => assert_eq!(code, proto::CODE_UNKNOWN_SESSION),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    kill(child);
+}
+
+#[tokio::test]
+async fn interrupt_with_no_turn_in_flight_is_still_acked() {
+    let env = Env::new().with_stub_acp_sessions();
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "tok_p4", "cli_p4", "interrupt-host");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws, "tok_p4").await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
+
+    let request = interrupt_envelope("test-alpha");
+    send_envelope(&mut ws, &request).await;
+    let reply = next_envelope(&mut ws)
+        .await
+        .expect("expected an `ack` reply");
+    assert_eq!(reply.id, request.id);
+    match reply.body {
+        Body::Ack(proto::AckBody { of }) => assert_eq!(of.as_deref(), Some(request.id.as_str())),
+        other => panic!("expected Ack, got {other:?}"),
+    }
+
+    kill(child);
+}
+
+#[tokio::test]
+async fn interrupt_to_unknown_session_errors_not_silently_dropped() {
+    let env = Env::new().with_stub_acp_sessions();
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "tok_p5", "cli_p5", "interrupt-host2");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws, "tok_p5").await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
+
+    let request = interrupt_envelope("no-such-session");
+    send_envelope(&mut ws, &request).await;
+    let reply = next_envelope(&mut ws)
+        .await
+        .expect("expected an `error` reply");
+    assert_eq!(reply.id, request.id);
+    match reply.body {
+        Body::Error(ErrorBody { code, .. }) => assert_eq!(code, proto::CODE_UNKNOWN_SESSION),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    kill(child);
+}
+
+#[tokio::test]
+async fn interrupting_one_session_over_the_wire_does_not_affect_its_sibling() {
+    let env = Env::new().with_stub_acp_sessions();
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "tok_p6", "cli_p6", "interrupt-host3");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws, "tok_p6").await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
+
+    // Start a turn on beta, interrupt alpha (idle — a clean no-op that
+    // still acks), then confirm beta's own turn completes untouched.
+    send_envelope(&mut ws, &prompt_envelope("test-beta", "hello")).await;
+    let interrupt_req = interrupt_envelope("test-alpha");
+    send_envelope(&mut ws, &interrupt_req).await;
+
+    let mut saw_ack = false;
+    let mut saw_beta_done = false;
+    for _ in 0..8 {
+        if saw_ack && saw_beta_done {
+            break;
+        }
+        let envelope = next_envelope(&mut ws).await.expect("expected a frame");
+        match envelope.body {
+            Body::Ack(proto::AckBody { of })
+                if of.as_deref() == Some(interrupt_req.id.as_str()) =>
+            {
+                saw_ack = true;
+            }
+            Body::Reply(proto::ReplyBody { session, done, .. })
+                if session == "test-beta" && done =>
+            {
+                saw_beta_done = true;
+            }
+            // A heartbeat `ping` genuinely can interleave here if this
+            // test happens to straddle the (real, default) heartbeat
+            // interval; answer it like a real server would so the
+            // connection doesn't time itself out mid-test.
+            Body::Ping(_) => {
+                let pong = proto::pong_reply(&envelope.id, "server", "test-server");
+                send_envelope(&mut ws, &pong).await;
+            }
+            Body::Reply(_) => continue,
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+    assert!(saw_ack, "expected an ack for the idle interrupt on alpha");
+    assert!(saw_beta_done, "expected beta's turn to complete normally");
 
     kill(child);
 }

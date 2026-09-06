@@ -102,6 +102,10 @@ pub enum InterruptOutcome {
 enum ManagerCommand {
     Prompt(String),
     Interrupt(oneshot::Sender<Result<InterruptOutcome, ManagerError>>),
+    /// Whether a turn is currently in flight (issue #49: presence's
+    /// `busy` field). Answered synchronously from `run_session`'s own
+    /// `busy` flag, the same one `Prompt`/`Interrupt` already consult.
+    IsBusy(oneshot::Sender<bool>),
 }
 
 /// One configured session's live runtime: its background task handle, the
@@ -109,7 +113,10 @@ enum ManagerCommand {
 /// events on.
 struct SessionHandle {
     command_tx: mpsc::UnboundedSender<ManagerCommand>,
-    event_rx: mpsc::UnboundedReceiver<DriverEvent>,
+    /// `None` once [`SessionManager::take_event_channels`] has taken it —
+    /// see that method's docs for why the wire layer needs to own these
+    /// directly rather than go through [`SessionManager::next_event`].
+    event_rx: Option<mpsc::UnboundedReceiver<DriverEvent>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -152,7 +159,7 @@ impl SessionManager {
                 config.name.clone(),
                 SessionHandle {
                     command_tx,
-                    event_rx,
+                    event_rx: Some(event_rx),
                     task,
                 },
             );
@@ -193,13 +200,63 @@ impl SessionManager {
 
     /// The next event from the named session's driven session. Returns
     /// `Ok(None)` once that session's connection has closed and all
-    /// buffered events are drained.
+    /// buffered events are drained, **or** once
+    /// [`take_event_channels`](Self::take_event_channels) has taken this
+    /// session's receiver for direct use elsewhere.
     pub async fn next_event(&mut self, name: &str) -> Result<Option<DriverEvent>, ManagerError> {
         let handle = self
             .handles
             .get_mut(name)
             .ok_or_else(|| ManagerError::UnknownSession(name.to_string()))?;
-        Ok(handle.event_rx.recv().await)
+        match handle.event_rx.as_mut() {
+            Some(rx) => Ok(rx.recv().await),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether the named session currently has a turn in flight — the
+    /// same `busy` flag [`prompt`](Self::prompt)/[`interrupt`](Self::interrupt)
+    /// already consult inside `run_session`, surfaced for issue #49's
+    /// `presence` frame (`crate::connection`).
+    pub async fn is_busy(&self, name: &str) -> Result<bool, ManagerError> {
+        let handle = self
+            .handles
+            .get(name)
+            .ok_or_else(|| ManagerError::UnknownSession(name.to_string()))?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .command_tx
+            .send(ManagerCommand::IsBusy(reply_tx))
+            .map_err(|_| ManagerError::Disconnected)?;
+        reply_rx.await.map_err(|_| ManagerError::Disconnected)
+    }
+
+    /// The name of every session this manager is driving.
+    pub fn session_names(&self) -> Vec<String> {
+        self.handles.keys().cloned().collect()
+    }
+
+    /// Takes ownership of every session's event receiver, keyed by
+    /// session name, for a caller that needs to drain **all** of them
+    /// concurrently.
+    ///
+    /// [`next_event`](Self::next_event) requires `&mut self` (a `HashMap`
+    /// lookup needs it), so polling several sessions' events at once
+    /// through it would mean serializing every session behind one
+    /// `&mut` — starving an idle session's prompt/interrupt handling
+    /// behind another session's still-open-ended event wait. The wire
+    /// layer (`crate::connection`) instead takes the raw receivers once,
+    /// up front, and polls them itself; [`prompt`](Self::prompt) and
+    /// [`interrupt`](Self::interrupt) only ever need `&self` (they just
+    /// send a command), so this doesn't block them.
+    ///
+    /// After this call, [`next_event`](Self::next_event) for any session
+    /// whose receiver was taken here returns `Ok(None)`.
+    pub fn take_event_channels(&mut self) -> HashMap<String, mpsc::UnboundedReceiver<DriverEvent>> {
+        self.handles
+            .iter_mut()
+            .filter_map(|(name, handle)| handle.event_rx.take().map(|rx| (name.clone(), rx)))
+            .collect()
     }
 
     /// Ends every session and waits for each background task (and its
@@ -263,6 +320,9 @@ async fn run_session(
                             };
                             let _ = reply_tx.send(result);
                         }
+                        Some(ManagerCommand::IsBusy(reply_tx)) => {
+                            let _ = reply_tx.send(busy);
+                        }
                     }
                 }
                 event = driver.next_event() => {
@@ -299,6 +359,9 @@ async fn run_session(
                         Ok(InterruptOutcome::NoTurnInFlight)
                     };
                     let _ = reply_tx.send(result);
+                }
+                Some(ManagerCommand::IsBusy(reply_tx)) => {
+                    let _ = reply_tx.send(busy);
                 }
             }
         }

@@ -11,13 +11,23 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
-use holler_client::config;
+use holler_client::config::{self, SessionRegistry};
 use holler_client::connection::{self, ConnectionStateStore, LiveState};
 use holler_client::credential::{CredentialStore, PersistedCredential};
 use holler_client::join::{JoinTransport, WsJoinTransport};
 use holler_client::proto::{self, QueryBody};
 use holler_client::query;
 use holler_client::server_address::ServerAddress;
+use holler_client::session_manager::SessionManager;
+
+/// How long `run_run` waits for [`SessionManager::spawn`] before giving up
+/// on local sessions for this invocation and connecting without them
+/// (issue #49). A hung or non-ACP-conformant configured harness must
+/// never block the WebSocket connection itself from coming up — `holler
+/// run` still answers `ping`/`query`/`hello` either way, it just can't
+/// dispatch `prompt`/`interrupt` for the sessions that failed to spawn
+/// (they answer `unknown_session`, same as an unconfigured one).
+const SESSION_MANAGER_SPAWN_BUDGET: Duration = Duration::from_secs(10);
 
 /// How long `holler detach` waits for a live `holler run` process to
 /// notice the detach marker and close its own socket before this
@@ -149,7 +159,13 @@ fn run_run(config: Option<&std::path::Path>) -> Result<(), String> {
 
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let result = runtime.block_on(async {
-        tokio::select! {
+        let mut session_manager = spawn_session_manager(&registry).await;
+        let mut event_channels = session_manager
+            .as_mut()
+            .map(|m| m.take_event_channels())
+            .unwrap_or_default();
+
+        let result = tokio::select! {
             res = connection::run(
                 &credential.server,
                 &credential.credential,
@@ -158,6 +174,8 @@ fn run_run(config: Option<&std::path::Path>) -> Result<(), String> {
                 &credential.hostname,
                 &registry,
                 &state,
+                session_manager.as_ref(),
+                &mut event_channels,
             ) => res,
             _ = tokio::signal::ctrl_c() => {
                 // Cancelling the `run` future here drops the socket
@@ -166,10 +184,55 @@ fn run_run(config: Option<&std::path::Path>) -> Result<(), String> {
                 // file is what actually matters for `holler status`.
                 Ok(())
             }
+        };
+
+        if let Some(manager) = session_manager {
+            manager.shutdown().await;
         }
+        result
     });
     state.clear();
     result.map_err(|e| e.to_string())
+}
+
+/// Spawns a [`SessionManager`] for every session whose harness is
+/// confirmed runnable right now — the same set `hello`/`presence`
+/// advertise (issue #49). Never fails `run_run` itself: a hung or
+/// non-ACP-conformant harness (confirmed only means "an executable file
+/// is on `PATH`", not "speaks ACP") just means this invocation connects
+/// without live sessions, answering `prompt`/`interrupt` for any of them
+/// with `unknown_session` — the same as an unconfigured session, not a
+/// reason to refuse the WebSocket connection itself.
+async fn spawn_session_manager(registry: &SessionRegistry) -> Option<SessionManager> {
+    let confirmed = registry.confirmed_harnesses();
+    let live_sessions: Vec<_> = registry
+        .sessions()
+        .iter()
+        .filter(|s| confirmed.contains(&s.harness))
+        .cloned()
+        .collect();
+    if live_sessions.is_empty() {
+        return None;
+    }
+    let live_registry = SessionRegistry::from_configs(live_sessions)
+        .expect("filtering an already-valid registry cannot introduce a duplicate name");
+
+    match tokio::time::timeout(
+        SESSION_MANAGER_SPAWN_BUDGET,
+        SessionManager::spawn(&live_registry, None),
+    )
+    .await
+    {
+        Ok(Ok(manager)) => Some(manager),
+        Ok(Err(err)) => {
+            eprintln!("holler: failed to start local sessions: {err}");
+            None
+        }
+        Err(_) => {
+            eprintln!("holler: timed out starting local sessions");
+            None
+        }
+    }
 }
 
 fn run_detach() -> Result<(), String> {
