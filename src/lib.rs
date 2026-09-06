@@ -10,6 +10,7 @@ pub mod credential;
 pub mod debug;
 pub mod join;
 pub mod proto;
+pub mod query;
 pub mod server_address;
 pub mod session_manager;
 pub mod status;

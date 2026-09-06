@@ -25,7 +25,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// v1 default harness and command, per issue #25 ("v1 default `command` is
 /// `opencode acp`").
@@ -148,6 +148,79 @@ impl SessionRegistry {
     pub fn sessions(&self) -> &[SessionConfig] {
         &self.sessions
     }
+
+    /// Harness ids that are both configured and, right now, actually
+    /// spawnable on this box — the "confirmed" bar (ADR-0001, holler-server
+    /// ADR-0001: "harnesses it can actually drive"), not merely "configured
+    /// to use". Sorted and deduped.
+    pub fn confirmed_harnesses(&self) -> Vec<String> {
+        let mut confirmed: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|s| command_is_runnable(&s.command))
+            .map(|s| s.harness.clone())
+            .collect();
+        confirmed.sort();
+        confirmed.dedup();
+        confirmed
+    }
+
+    /// The configured command for `harness`, rendered as a display string
+    /// (e.g. `"opencode acp"`), if at least one configured session naming
+    /// that harness is confirmed runnable right now. Used for `holler
+    /// support`'s `how` field (`crate::query`).
+    pub fn confirmed_command_for_harness(&self, harness: &str) -> Option<String> {
+        self.sessions
+            .iter()
+            .find(|s| s.harness == harness && command_is_runnable(&s.command))
+            .map(|s| s.command.join(" "))
+    }
+}
+
+/// Whether `path` is a file this process could actually execute right now.
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Resolves `program` to an executable file: a direct check if it names a
+/// path (contains a path separator), otherwise a scan of `dirs` (mirroring
+/// shell `$PATH` lookup; this only needs to know whether *any* directory
+/// has a match, not which one wins).
+fn resolve_executable<'a>(program: &str, dirs: impl Iterator<Item = &'a Path>) -> bool {
+    if program.contains(std::path::MAIN_SEPARATOR) {
+        return is_executable_file(Path::new(program));
+    }
+    dirs.map(|dir| dir.join(program))
+        .any(|candidate| is_executable_file(&candidate))
+}
+
+/// Whether `command`'s program (`command[0]`) is actually spawnable on this
+/// box right now, via `$PATH`. An empty command is never runnable. This is
+/// a real filesystem/PATH check — deliberately *not* whether the harness is
+/// merely present in [`SessionRegistry`]'s config, per ADR-0001's "known vs
+/// confirmed" distinction.
+pub fn command_is_runnable(command: &[String]) -> bool {
+    let Some(program) = command.first() else {
+        return false;
+    };
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    resolve_executable(program, path_dirs.iter().map(PathBuf::as_path))
 }
 
 /// Parses body config from a TOML string and builds a [`SessionRegistry`].
@@ -246,6 +319,89 @@ mod tests {
             ConfigError::DuplicateSessionName(name) => assert_eq!(name, "alpha"),
             other => panic!("expected DuplicateSessionName, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn command_is_runnable_true_for_real_absolute_executable() {
+        // A direct path bypasses PATH scanning entirely, so this is
+        // deterministic regardless of the test host's $PATH.
+        assert!(command_is_runnable(&["/bin/sh".to_string()]));
+    }
+
+    #[test]
+    fn command_is_runnable_false_for_missing_absolute_path() {
+        assert!(!command_is_runnable(&["/no/such/executable/here".to_string()]));
+    }
+
+    #[test]
+    fn command_is_runnable_false_for_empty_command() {
+        assert!(!command_is_runnable(&[]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_executable_finds_executable_file_in_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("fake-harness");
+        std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&exe).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&exe, perms).unwrap();
+
+        assert!(resolve_executable("fake-harness", std::iter::once(dir.path())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_executable_false_for_non_executable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("not-executable"), "no shebang, no bits").unwrap();
+
+        assert!(!resolve_executable("not-executable", std::iter::once(dir.path())));
+    }
+
+    #[test]
+    fn resolve_executable_false_when_absent_from_every_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!resolve_executable("nope", std::iter::once(dir.path())));
+    }
+
+    #[test]
+    fn confirmed_harnesses_only_includes_runnable_ones() {
+        let registry = SessionRegistry::from_configs(vec![
+            SessionConfig {
+                name: "a".to_string(),
+                harness: "opencode".to_string(),
+                command: vec!["/bin/sh".to_string()],
+                interrupt: None,
+            },
+            SessionConfig {
+                name: "b".to_string(),
+                harness: "claude".to_string(),
+                command: vec!["/no/such/binary".to_string()],
+                interrupt: None,
+            },
+        ])
+        .unwrap();
+        assert_eq!(registry.confirmed_harnesses(), vec!["opencode".to_string()]);
+    }
+
+    #[test]
+    fn confirmed_command_for_harness_returns_display_string_or_none() {
+        let registry = SessionRegistry::from_configs(vec![SessionConfig {
+            name: "a".to_string(),
+            harness: "opencode".to_string(),
+            command: vec!["/bin/sh".to_string(), "-c".to_string()],
+            interrupt: None,
+        }])
+        .unwrap();
+        assert_eq!(
+            registry.confirmed_command_for_harness("opencode"),
+            Some("/bin/sh -c".to_string())
+        );
+        assert_eq!(registry.confirmed_command_for_harness("claude"), None);
     }
 
     #[test]
