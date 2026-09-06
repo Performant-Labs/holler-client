@@ -1316,3 +1316,189 @@ async fn interrupting_one_session_over_the_wire_does_not_affect_its_sibling() {
 
     kill(child);
 }
+
+// --- Single-instance guard (issue #52) -------------------------------------
+
+#[tokio::test]
+async fn second_run_refuses_to_start_while_first_is_live() {
+    let env = Env::new();
+    let (listener, url) = bind_local().await;
+    env.write_credential(
+        &url,
+        "hlr_live_good",
+        "tok_lock1",
+        "cli_lock1",
+        "lock-host1",
+    );
+
+    let mut first = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws, "tok_lock1").await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
+
+    env.wait_for_status(STATUS_BUDGET, |doc| doc["connected"] == true);
+
+    // A second `run` against the same state dir must refuse immediately,
+    // not hang, retry, or start a second racing connection.
+    let mut second = spawn_run_capturing_stderr(&env);
+    let status = wait_for_exit(&mut second, Duration::from_secs(5))
+        .expect("second `holler run` should refuse to start promptly, not hang");
+    assert!(
+        !status.success(),
+        "expected a non-zero exit for a second instance against the same state dir"
+    );
+    let mut stderr = String::new();
+    second
+        .stderr
+        .take()
+        .expect("stderr was piped")
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        stderr.to_lowercase().contains("already"),
+        "stderr should clearly explain the refusal, got: {stderr:?}"
+    );
+
+    // The first process must be completely unaffected by the second
+    // instance's failed attempt: still alive, still observable.
+    assert!(
+        matches!(first.try_wait(), Ok(None)),
+        "first `run` process should still be alive after a second instance was refused"
+    );
+    assert_eq!(
+        env.status_json()["connected"],
+        true,
+        "first run's status should still report connected"
+    );
+
+    kill(first);
+}
+
+#[tokio::test]
+async fn fresh_run_starts_normally_after_a_prior_run_was_killed_uncleanly() {
+    let env = Env::new();
+    let (listener, url) = bind_local().await;
+    env.write_credential(
+        &url,
+        "hlr_live_good",
+        "tok_lock2",
+        "cli_lock2",
+        "lock-host2",
+    );
+
+    let mut first = spawn_run(&env);
+
+    {
+        let mut ws = accept_ws(&listener).await;
+        expect_auth(&mut ws, "tok_lock2").await;
+        send_envelope(&mut ws, &server_hello_envelope()).await;
+        next_envelope(&mut ws)
+            .await
+            .expect("expected client `hello`");
+        next_envelope(&mut ws)
+            .await
+            .expect("expected client `presence`");
+        // Check `connected` while `ws` is still open: dropping it first
+        // would race the client's own drop-detection, which can flip the
+        // persisted state to `reconnecting` (and then get stuck there,
+        // since nothing accepts its retry) before this ever gets to look.
+        env.wait_for_status(STATUS_BUDGET, |doc| doc["connected"] == true);
+    }
+
+    // Simulate a crash (SIGKILL), not a graceful `holler detach` — the
+    // process gets no chance to release anything explicitly. The kernel
+    // releasing the advisory `flock` the instant this process's file
+    // descriptors close (even on SIGKILL) is exactly the property under
+    // test: a stale lock from an unclean exit must not block a fresh run.
+    first.kill().expect("failed to SIGKILL the first `run`");
+    first.wait().expect("failed to reap the killed `run`");
+
+    let second = spawn_run(&env);
+    let mut ws2 = accept_ws(&listener).await;
+    expect_auth(&mut ws2, "tok_lock2").await;
+    send_envelope(&mut ws2, &server_hello_envelope()).await;
+    next_envelope(&mut ws2)
+        .await
+        .expect("expected client `hello`");
+    next_envelope(&mut ws2)
+        .await
+        .expect("expected client `presence`");
+
+    let status = env.wait_for_status(STATUS_BUDGET, |doc| doc["connected"] == true);
+    assert_eq!(status["client_id"], "cli_lock2");
+
+    kill(second);
+}
+
+#[tokio::test]
+async fn detach_works_with_the_instance_lock_held_and_releases_it_on_clean_exit() {
+    let env = Env::new();
+    let (listener, url) = bind_local().await;
+    env.write_credential(
+        &url,
+        "hlr_live_good",
+        "tok_lock3",
+        "cli_lock3",
+        "lock-host3",
+    );
+
+    let mut child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws, "tok_lock3").await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
+
+    env.wait_for_status(STATUS_BUDGET, |doc| doc["connected"] == true);
+
+    // Regression: `holler detach` must still find and signal the live
+    // `run` process with the new lock in place.
+    let detach_out = env.cmd().arg("detach").output().unwrap();
+    assert!(detach_out.status.success(), "{detach_out:?}");
+    assert!(String::from_utf8(detach_out.stdout)
+        .unwrap()
+        .contains("detached"));
+
+    let status = wait_for_exit(&mut child, Duration::from_secs(5)).expect(
+        "`holler run` should exit once detach is requested, even with the instance lock held",
+    );
+    assert!(status.success(), "expected a clean exit on detach");
+
+    // Detach deletes the credential; re-persist it (same as this file's
+    // other fixtures stand in for a real `join`) so a fresh `run` has
+    // something to resume with, and confirm the lock the just-exited
+    // process held is fully released by its own clean exit — not only on
+    // a crash (see the SIGKILL-based test above).
+    env.write_credential(
+        &url,
+        "hlr_live_good",
+        "tok_lock3",
+        "cli_lock3",
+        "lock-host3",
+    );
+    let second = spawn_run(&env);
+    let mut ws2 = accept_ws(&listener).await;
+    expect_auth(&mut ws2, "tok_lock3").await;
+    send_envelope(&mut ws2, &server_hello_envelope()).await;
+    next_envelope(&mut ws2)
+        .await
+        .expect("expected client `hello`");
+    next_envelope(&mut ws2)
+        .await
+        .expect("expected client `presence`");
+    env.wait_for_status(STATUS_BUDGET, |doc| doc["connected"] == true);
+
+    kill(second);
+}

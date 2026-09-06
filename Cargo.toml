@@ -42,6 +42,12 @@ futures-util = { version = "0.3.34", features = ["sink"] }
 # `hello.rs` uses for the same purpose — avoids hand-rolling date math for
 # a field the wire codec never parses back anyway.
 time = { version = "0.3", features = ["formatting", "parsing"] }
+# Advisory `flock` for the single-instance guard on `holler run` (issue
+# #52). Already present as a transitive dependency of several crates in
+# this tree (see Cargo.lock) — declaring it directly just makes explicit
+# use of what's already compiled in, rather than pulling in a new crate
+# (e.g. `fs2`) for the same syscall.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

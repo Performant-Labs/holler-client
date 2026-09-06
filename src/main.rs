@@ -14,6 +14,7 @@ use clap::{Parser, Subcommand};
 use holler_client::config::{self, SessionRegistry};
 use holler_client::connection::{self, ConnectionStateStore, LiveState};
 use holler_client::credential::{CredentialStore, PersistedCredential};
+use holler_client::instance_lock::InstanceLock;
 use holler_client::join::{JoinTransport, WsJoinTransport};
 use holler_client::proto::{self, QueryBody};
 use holler_client::query;
@@ -144,6 +145,12 @@ fn run_join(server: &str, token: &str) -> Result<(), String> {
 }
 
 fn run_run(config: Option<&std::path::Path>) -> Result<(), String> {
+    // Issue #52: refuse to start a second `run` against the same state
+    // dir rather than racing it. Held for this process's whole lifetime
+    // (including a crash — the OS releases it when our file descriptors
+    // close) so a later `run` can tell a live sibling from a stale lock.
+    let _instance_lock = InstanceLock::acquire_default().map_err(|e| e.to_string())?;
+
     let store = CredentialStore::open().map_err(|e| e.to_string())?;
     let credential = store
         .load()

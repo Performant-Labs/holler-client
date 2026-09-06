@@ -8,6 +8,7 @@ pub mod config;
 pub mod connection;
 pub mod credential;
 pub mod debug;
+pub mod instance_lock;
 pub mod join;
 pub mod proto;
 pub mod query;
