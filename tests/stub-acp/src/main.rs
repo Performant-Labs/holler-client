@@ -37,7 +37,8 @@
 //!   `{"sessionId": ...}`.
 //! - `session/prompt` params: `{"sessionId": ..., "prompt": [...]}`.
 //!   Before replying to the request, the stub emits one
-//!   `session/update` notification with a fixed canned reply — a
+//!   `session/update` notification per `--chunks N` (default 1, see
+//!   `main`) with a fixed canned reply — a
 //!   `SessionNotification` whose `update` is an
 //!   `AgentMessageChunk`/`ContentBlock::Text` carrying the constant
 //!   text `"PONG"` (`{"sessionId": ..., "update": {"sessionUpdate":
@@ -85,6 +86,19 @@ struct Session {
 }
 
 fn main() {
+    // `--chunks N` (default 1): emit N `agent_message_chunk` updates per
+    // prompt instead of one, so a fixture can exercise a genuinely
+    // streamed turn — notably the client's reply coalescing (issue #83),
+    // which is invisible with a single chunk. Passed as an argument
+    // rather than an env var because tests share one process's
+    // environment and would race.
+    let chunks_per_turn = std::env::args()
+        .skip_while(|a| a != "--chunks")
+        .nth(1)
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     let mut sessions: HashMap<String, Session> = HashMap::new();
@@ -103,11 +117,16 @@ fn main() {
                 continue;
             }
         };
-        handle_message(&msg, &mut sessions, &mut stdout);
+        handle_message(&msg, &mut sessions, &mut stdout, chunks_per_turn);
     }
 }
 
-fn handle_message(msg: &Value, sessions: &mut HashMap<String, Session>, out: &mut impl Write) {
+fn handle_message(
+    msg: &Value,
+    sessions: &mut HashMap<String, Session>,
+    out: &mut impl Write,
+    chunks_per_turn: usize,
+) {
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let request_id = msg.get("id").filter(|v| !v.is_null()).cloned();
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
@@ -150,17 +169,19 @@ fn handle_message(msg: &Value, sessions: &mut HashMap<String, Session>, out: &mu
                 .map(|s| std::mem::take(&mut s.cancel_pending))
                 .unwrap_or(false);
 
-            notify(
-                out,
-                "session/update",
-                json!({
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": "agent_message_chunk",
-                        "content": { "type": "text", "text": "PONG" },
-                    },
-                }),
-            );
+            for _ in 0..chunks_per_turn {
+                notify(
+                    out,
+                    "session/update",
+                    json!({
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": { "type": "text", "text": "PONG" },
+                        },
+                    }),
+                );
+            }
 
             let stop_reason = if cancelled { "cancelled" } else { "end_turn" };
             if let Some(id) = request_id {

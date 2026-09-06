@@ -101,6 +101,25 @@ command = ["opencode", "acp"]
     /// `session/new` handshake the fake script (which just exits) can't
     /// answer. `stub-acp`'s path is absolute, so it's confirmed runnable
     /// with no `$PATH` setup needed (unlike `with_fake_executable`).
+    /// One session whose stub emits `chunks` streamed updates per turn,
+    /// for exercising reply coalescing (issue #83).
+    fn with_stub_acp_chunks(self, chunks: usize) -> Self {
+        let stub_acp = env!("CARGO_BIN_EXE_stub-acp");
+        std::fs::write(
+            &self.config_path,
+            format!(
+                r#"
+[[session]]
+name = "test-alpha"
+harness = "stub-acp"
+command = ["{stub_acp}", "--chunks", "{chunks}"]
+"#
+            ),
+        )
+        .unwrap();
+        self
+    }
+
     fn with_stub_acp_sessions(self) -> Self {
         let stub_acp = env!("CARGO_BIN_EXE_stub-acp");
         std::fs::write(
@@ -1128,35 +1147,110 @@ async fn prompt_dispatches_to_session_and_streams_reply_then_done() {
     send_envelope(&mut ws, &request).await;
 
     // stub-acp answers with one "PONG" update chunk, then ends the turn.
-    let update = next_envelope(&mut ws)
-        .await
-        .expect("expected a `reply` chunk");
-    assert_eq!(update.id, request.id, "reply must reuse the prompt's id");
-    match update.body {
-        Body::Reply(proto::ReplyBody {
-            session,
-            text,
-            done,
-            ..
-        }) => {
-            assert_eq!(session, "test-alpha");
-            assert_eq!(text.as_deref(), Some("PONG"));
-            assert!(!done);
+    //
+    // Asserted as a contract rather than a fixed frame count: since issue
+    // #83 the client coalesces streamed updates, so how many frames carry
+    // the text is a scheduling detail (a turn that ends inside the
+    // debounce window ships its text on the terminal frame). What must
+    // hold is that every frame reuses the prompt's id, the concatenation
+    // of `text` + `chunks` across frames is exactly the reply, and
+    // exactly one frame closes the turn — which is what holler-server
+    // reassembles (`registry.rs`, spec §10).
+    let mut assembled = String::new();
+    let mut terminal_frames = 0;
+    loop {
+        let frame = next_envelope(&mut ws)
+            .await
+            .expect("expected a `reply` frame before the turn ended");
+        assert_eq!(frame.id, request.id, "reply must reuse the prompt's id");
+        match frame.body {
+            Body::Reply(proto::ReplyBody {
+                session,
+                text,
+                chunks,
+                done,
+                ..
+            }) => {
+                assert_eq!(session, "test-alpha");
+                if let Some(t) = text {
+                    assembled.push_str(&t);
+                }
+                for chunk in chunks {
+                    assembled.push_str(&chunk);
+                }
+                if done {
+                    terminal_frames += 1;
+                    break;
+                }
+            }
+            other => panic!("expected Reply, got {other:?}"),
         }
-        other => panic!("expected Reply, got {other:?}"),
+    }
+    assert_eq!(assembled, "PONG", "no streamed text may be lost");
+    assert_eq!(terminal_frames, 1, "exactly one frame closes the turn");
+
+    kill(child);
+}
+
+#[tokio::test]
+async fn many_streamed_updates_coalesce_into_fewer_frames() {
+    // Issue #83: the client used to emit one wire frame per ACP update,
+    // re-sending ~130 bytes of invariant preamble every time. Here the
+    // stub streams 8 updates in a tight loop — well inside the debounce
+    // window — so they must arrive as *fewer* frames than updates, with
+    // every byte of text intact.
+    const UPDATES: usize = 8;
+
+    let env = Env::new().with_stub_acp_chunks(UPDATES);
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "tok_c1", "cli_c1", "coalesce-host");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws, "tok_c1").await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws).await.expect("client `hello`");
+    next_envelope(&mut ws).await.expect("client `presence`");
+
+    let request = prompt_envelope("test-alpha", "hello");
+    send_envelope(&mut ws, &request).await;
+
+    let mut assembled = String::new();
+    let mut frames = 0;
+    loop {
+        let frame = next_envelope(&mut ws).await.expect("expected a `reply`");
+        assert_eq!(frame.id, request.id, "every chunk reuses the prompt id");
+        match frame.body {
+            Body::Reply(proto::ReplyBody {
+                text, chunks, done, ..
+            }) => {
+                frames += 1;
+                if let Some(t) = text {
+                    assembled.push_str(&t);
+                }
+                for chunk in chunks {
+                    assembled.push_str(&chunk);
+                }
+                if done {
+                    break;
+                }
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
     }
 
-    let done_reply = next_envelope(&mut ws)
-        .await
-        .expect("expected the final `reply` with done: true");
-    assert_eq!(done_reply.id, request.id);
-    match done_reply.body {
-        Body::Reply(proto::ReplyBody { session, done, .. }) => {
-            assert_eq!(session, "test-alpha");
-            assert!(done);
-        }
-        other => panic!("expected Reply, got {other:?}"),
-    }
+    // The invariant that must never break, whatever the batching:
+    assert_eq!(
+        assembled,
+        "PONG".repeat(UPDATES),
+        "no streamed text may be lost or reordered by coalescing"
+    );
+    // The point of the change: strictly fewer frames than updates.
+    assert!(
+        frames < UPDATES,
+        "expected {UPDATES} updates to coalesce into fewer than {UPDATES} frames, got {frames}"
+    );
 
     kill(child);
 }

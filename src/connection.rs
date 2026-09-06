@@ -62,7 +62,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -81,6 +81,7 @@ use crate::proto::{
     CODE_UNAUTHENTICATED, CODE_UNKNOWN_SESSION,
 };
 use crate::query;
+use crate::reply_coalescer::ReplyCoalescer;
 use crate::session_manager::{ManagerError, SessionManager};
 use crate::status::SessionStatus;
 
@@ -512,6 +513,55 @@ async fn recv_any_event(channels: &mut EventChannels) -> Option<(String, DriverE
     .await
 }
 
+/// Sends one `reply` frame carrying `chunks` — several streamed updates
+/// coalesced into a single frame (issue #83).
+///
+/// `ReplyBody` has always had a `chunks` field for this, and holler-server
+/// joins `text` and `chunks` in arrival order (spec §10), so a batch is
+/// reassembled identically to the one-frame-per-update stream it replaces.
+/// `text` is left `None`: everything rides in `chunks`.
+///
+/// Returns `false` if the socket write failed, so the caller can drop the
+/// connection. An empty non-terminal batch sends nothing — only a `done`
+/// frame is worth sending with no text.
+#[allow(clippy::too_many_arguments)]
+async fn send_reply_chunks(
+    ws: &mut WsStream,
+    cfg: DebugConfig,
+    reply_id: &str,
+    client_id: &str,
+    session: &str,
+    chunks: Vec<String>,
+    done: bool,
+) -> bool {
+    if chunks.is_empty() && !done {
+        return true;
+    }
+    let coalesced = chunks.len();
+    // A batch of one keeps the pre-coalescing wire shape exactly: `text`
+    // set, `chunks` empty. Only a genuine batch uses `chunks`, so the
+    // common short-reply case is byte-identical to before and stays
+    // readable to any peer that only looks at `text`.
+    let (text, chunks) = if chunks.len() == 1 {
+        (chunks.into_iter().next(), Vec::new())
+    } else {
+        (None, chunks)
+    };
+    let reply = proto::reply(reply_id, client_id, session, text, chunks, done);
+    let Ok(raw) = proto::encode(&reply) else {
+        return true;
+    };
+    debug::outgoing(cfg, "reply")
+        .id(reply_id)
+        .peer(client_id)
+        .field("session", session)
+        .field("chunks", coalesced.to_string())
+        .field("done", done.to_string())
+        .frame(|| raw.clone())
+        .emit();
+    ws.send(Message::Text(raw.into())).await.is_ok()
+}
+
 /// Services one live connection: answers `ping` with `pong` (including
 /// hostname, per the issue), sends this client's own heartbeat `ping` on
 /// [`heartbeat_interval`], polls for a detach request, and (issue #49)
@@ -547,8 +597,17 @@ async fn session_loop(
     // "ask again" contract (nothing about a pre-drop turn's identity is
     // assumed to survive the drop).
     let mut last_prompt_id: HashMap<String, String> = HashMap::new();
+    // Issue #83: batch streamed updates rather than sending one frame per
+    // ACP event, where ~130 bytes of every ~200-byte frame is the same
+    // invariant preamble repeated per chunk.
+    let mut coalescer = ReplyCoalescer::default();
 
     loop {
+        // Recomputed each iteration and captured by value, so the flush
+        // branch's future never borrows `coalescer` across the await —
+        // the arm body needs it mutably.
+        let flush_at = coalescer.next_deadline();
+
         tokio::select! {
             incoming = ws.next() => {
                 match incoming {
@@ -775,29 +834,63 @@ async fn session_loop(
                     .get(&name)
                     .cloned()
                     .unwrap_or_else(proto::new_id);
-                let reply = match event {
+                match event {
                     DriverEvent::Update(text) => {
-                        Some(proto::reply(&reply_id, client_id, &name, Some(text), vec![], false))
+                        // Buffered, not sent: the flush branch below or the
+                        // turn's end releases it. Only a byte-cap overflow
+                        // sends immediately.
+                        if let Some(batch) = coalescer.push(&name, text, Instant::now()) {
+                            if !send_reply_chunks(
+                                &mut ws, cfg, &reply_id, client_id, &name, batch, false,
+                            )
+                            .await
+                            {
+                                return LoopExit::Dropped("failed to send reply".to_string());
+                            }
+                        }
                     }
                     DriverEvent::StopReason(_) => {
+                        // Straggling chunks ride out *with* the terminal
+                        // frame: nothing is dropped, and `done` is never
+                        // delayed behind the debounce timer.
+                        let tail = coalescer.take(&name);
                         last_prompt_id.remove(&name);
-                        Some(proto::reply(&reply_id, client_id, &name, None, vec![], true))
+                        if !send_reply_chunks(
+                            &mut ws, cfg, &reply_id, client_id, &name, tail, true,
+                        )
+                        .await
+                        {
+                            return LoopExit::Dropped("failed to send reply".to_string());
+                        }
                     }
                     // Presence/busy tracking is answered by the
                     // `presence` frame at (re)connect time, not streamed
                     // mid-turn — see module docs on issue #52's
                     // "ask again" contract.
-                    DriverEvent::Status(DriverStatus::Working | DriverStatus::Idle | DriverStatus::Blocked) => None,
-                };
-                if let Some(reply) = reply {
-                    let Ok(raw) = proto::encode(&reply) else { continue };
-                    debug::outgoing(cfg, "reply")
-                        .id(&reply_id)
-                        .peer(client_id)
-                        .field("session", name.as_str())
-                        .frame(|| raw.clone())
-                        .emit();
-                    if ws.send(Message::Text(raw.into())).await.is_err() {
+                    DriverEvent::Status(DriverStatus::Working | DriverStatus::Idle | DriverStatus::Blocked) => {}
+                }
+            }
+            // Debounce expiry: release whichever sessions' windows have
+            // closed. Never wins when nothing is buffered (`pending`
+            // never resolves), so an idle connection has no extra wakeups.
+            _ = async move {
+                match flush_at {
+                    Some(deadline) => {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                for (session, chunks) in coalescer.due(Instant::now()) {
+                    let reply_id = last_prompt_id
+                        .get(&session)
+                        .cloned()
+                        .unwrap_or_else(proto::new_id);
+                    if !send_reply_chunks(
+                        &mut ws, cfg, &reply_id, client_id, &session, chunks, false,
+                    )
+                    .await
+                    {
                         return LoopExit::Dropped("failed to send reply".to_string());
                     }
                 }
