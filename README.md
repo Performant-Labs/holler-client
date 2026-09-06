@@ -66,6 +66,34 @@ HOLLER_SERVER_HOST=io ./scripts/run app:local:tunnel
 
 Each maps to a same-named `scripts/local-*.sh` file if you'd rather call the script directly. `--debug=noisy` is the default for `app:local:run` deliberately — this is the dev/test entry point, and full frame visibility (secrets already redacted) is exactly what you want here.
 
+### Debug output
+
+Two global flags control the debug log, each overriding its environment variable when both are set:
+
+| Flag | Env | Values | Default |
+|---|---|---|---|
+| `--debug` | `HOLLER_DEBUG` | `none`, `quiet`, `noisy` | `none` |
+| `--log-format` | `HOLLER_LOG_FORMAT` | `text`, `json` | `text` |
+
+An invalid value at whichever level wins is an error — it never silently falls back to the default. Redaction applies identically in both formats: the join token, client credential, connect ticket, and `Authorization` header are never printed in the clear.
+
+`text` is a fixed-width console line for a human tailing a session — emission timestamp first, then direction, frame type, and `k=v` pairs. At `noisy` the redacted frame JSON is appended last, so a line's frame can still be copied out and replayed:
+
+```
+2026-09-06T20:59:54.712345Z DEBUG -> auth       id=c14fb1a960b3 peer=tok_fb2d7e54 {"v":1,"type":"auth",...}
+2026-09-06T20:59:54.883012Z DEBUG <- hello      id=12cfd6a8e401 peer=server       {"v":1,"type":"hello",...}
+```
+
+`json` is JSON Lines — the whole line is one object, so `jq`/Vector/Loki/Datadog can ingest the stream directly, and the frame is nested under `frame` (`jq .frame`):
+
+```
+holler run --debug=noisy --log-format=json 2>debug.log
+jq -e . debug.log > /dev/null   # every line parses
+jq -r .ts debug.log | sort -c   # emission timestamps are ordered
+```
+
+The leading `ts` is an **emission** timestamp — when this process logged the line, from this host's clock — at fixed RFC 3339 microsecond precision, so the column is genuinely fixed-width. That is deliberately not the frame's own `ts`, which is the peer's claim from the peer's clock; the two diverge enough in practice (~180ms measured cross-machine) that sorting a handshake by frame `ts` reorders it against causality. Sort a log by `ts`, not by `.frame.ts`.
+
 ## Architecture
 
 `holler join` and `holler run` are two separate steps, not one. `join` is a one-shot redeem: it exchanges the server's one-time token for a persisted `client_id` + long-lived credential, then exits — it does not touch any local agent. `run` is the long-lived process: it reads the session config, spawns one ACP subprocess per configured session (via [`agent-client-protocol`](https://github.com/agentclientprotocol/rust-sdk) v1, JSON-RPC over stdio), and only then opens the live WebSocket to the server. A hung or non-conformant harness can't block the connection itself from coming up — `run` still answers `ping`/`query`/`hello` either way, it just can't route `prompt`/`interrupt` to whichever session failed to spawn.

@@ -32,7 +32,7 @@
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::debug::{self, DebugLevel};
+use crate::debug::{self, DebugConfig};
 use crate::proto::{self, Body, ErrorBody};
 use crate::server_address::ServerAddress;
 
@@ -83,7 +83,7 @@ pub trait JoinTransport {
         server: &ServerAddress,
         token: &str,
         hostname: &str,
-        debug_level: DebugLevel,
+        cfg: DebugConfig,
     ) -> Result<RedeemedIdentity, JoinError>;
 }
 
@@ -106,7 +106,7 @@ impl JoinTransport for StubJoinTransport {
         server: &ServerAddress,
         token: &str,
         hostname: &str,
-        _debug_level: DebugLevel,
+        _cfg: DebugConfig,
     ) -> Result<RedeemedIdentity, JoinError> {
         // A new join token is a new pairing (per protocol), so the derived
         // client_id depends on `token` too, not just server/hostname.
@@ -158,14 +158,14 @@ impl JoinTransport for WsJoinTransport {
         server: &ServerAddress,
         token: &str,
         hostname: &str,
-        debug_level: DebugLevel,
+        cfg: DebugConfig,
     ) -> Result<RedeemedIdentity, JoinError> {
         let (token_id, secret) = split_token_id_and_secret(token)?;
 
         let runtime = tokio::runtime::Runtime::new().map_err(|e| {
             JoinError::Failed(format!("failed to start async runtime for join: {e}"))
         })?;
-        runtime.block_on(redeem_async(server, token_id, secret, hostname, debug_level))
+        runtime.block_on(redeem_async(server, token_id, secret, hostname, cfg))
     }
 }
 
@@ -176,10 +176,13 @@ async fn redeem_async(
     token_id: &str,
     secret: &str,
     hostname: &str,
-    debug_level: DebugLevel,
+    cfg: DebugConfig,
 ) -> Result<RedeemedIdentity, JoinError> {
-    if debug_level != DebugLevel::None {
-        eprintln!("holler: debug={debug_level} — writing frames to stderr, secrets redacted");
+    if cfg.is_on() {
+        eprintln!(
+            "holler: debug={} format={} — writing frames to stderr, secrets redacted",
+            cfg.level, cfg.format
+        );
     }
     let url = server.to_canonical_url();
     let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
@@ -188,11 +191,11 @@ async fn redeem_async(
 
     let envelope = proto::join_envelope(token_id, secret, hostname);
     let raw = proto::encode(&envelope).expect("v1 join envelope always serializes");
-    debug::log(
-        debug_level,
-        || format!("-> join token_id={token_id}"),
-        || format!("-> {}", debug::redact_secret(&raw, secret)),
-    );
+    debug::outgoing(cfg, "join")
+        .id(&envelope.id)
+        .peer(token_id)
+        .frame(|| debug::redact_secret(&raw, secret))
+        .emit();
     if let Err(e) = ws.send(Message::Text(raw.into())).await {
         return Err(JoinError::Failed(format!("failed to send join: {e}")));
     }
@@ -226,11 +229,11 @@ async fn redeem_async(
         .map_err(|e| JoinError::Failed(format!("malformed frame awaiting join_ok: {e}")))?;
     match reply.body {
         Body::JoinOk(body) => {
-            debug::log(
-                debug_level,
-                || format!("<- join_ok client_id={}", body.client_id),
-                || format!("<- {}", debug::redact_secret(&reply_raw, &body.credential)),
-            );
+            debug::incoming(cfg, "join_ok")
+                .id(&reply.id)
+                .peer(&body.client_id)
+                .frame(|| debug::redact_secret(&reply_raw, &body.credential))
+                .emit();
             Ok(RedeemedIdentity {
                 client_id: body.client_id,
                 credential: body.credential,
@@ -238,11 +241,11 @@ async fn redeem_async(
             })
         }
         Body::Error(ErrorBody { code, message, .. }) => {
-            debug::log(
-                debug_level,
-                || format!("<- error code={code}"),
-                || format!("<- {reply_raw}"),
-            );
+            debug::incoming(cfg, "error")
+                .id(&reply.id)
+                .field("code", code.as_str())
+                .frame(|| reply_raw.clone())
+                .emit();
             Err(JoinError::Failed(
                 message.unwrap_or_else(|| format!("join failed ({code})")),
             ))
@@ -277,17 +280,17 @@ mod tests {
 
     #[test]
     fn stub_redeem_succeeds() {
-        let identity = StubJoinTransport.redeem(&server(), "hlr_join_sometoken", "kiwi", DebugLevel::None);
+        let identity = StubJoinTransport.redeem(&server(), "hlr_join_sometoken", "kiwi", DebugConfig::default());
         assert!(identity.is_ok());
     }
 
     #[test]
     fn stub_redeem_is_deterministic_for_same_inputs() {
         let a = StubJoinTransport
-            .redeem(&server(), "hlr_join_sometoken", "kiwi", DebugLevel::None)
+            .redeem(&server(), "hlr_join_sometoken", "kiwi", DebugConfig::default())
             .unwrap();
         let b = StubJoinTransport
-            .redeem(&server(), "hlr_join_sometoken", "kiwi", DebugLevel::None)
+            .redeem(&server(), "hlr_join_sometoken", "kiwi", DebugConfig::default())
             .unwrap();
         assert_eq!(a, b);
     }
@@ -295,10 +298,10 @@ mod tests {
     #[test]
     fn stub_redeem_varies_with_token() {
         let a = StubJoinTransport
-            .redeem(&server(), "hlr_join_one", "kiwi", DebugLevel::None)
+            .redeem(&server(), "hlr_join_one", "kiwi", DebugConfig::default())
             .unwrap();
         let b = StubJoinTransport
-            .redeem(&server(), "hlr_join_two", "kiwi", DebugLevel::None)
+            .redeem(&server(), "hlr_join_two", "kiwi", DebugConfig::default())
             .unwrap();
         assert_ne!(a.credential, b.credential);
     }
@@ -306,7 +309,7 @@ mod tests {
     #[test]
     fn stub_redeem_uses_expected_prefixes() {
         let identity = StubJoinTransport
-            .redeem(&server(), "hlr_join_sometoken", "kiwi", DebugLevel::None)
+            .redeem(&server(), "hlr_join_sometoken", "kiwi", DebugConfig::default())
             .unwrap();
         assert!(identity.client_id.starts_with("cli_"));
         assert!(identity.credential.starts_with("hlr_live_"));
@@ -315,7 +318,7 @@ mod tests {
     #[test]
     fn stub_redeem_never_echoes_the_join_token() {
         let token = "hlr_join_veryunique";
-        let identity = StubJoinTransport.redeem(&server(), token, "kiwi", DebugLevel::None).unwrap();
+        let identity = StubJoinTransport.redeem(&server(), token, "kiwi", DebugConfig::default()).unwrap();
         assert!(!identity.client_id.contains(token));
         assert!(!identity.credential.contains(token));
         assert!(!format!("{identity:?}").contains(token));
@@ -340,7 +343,7 @@ mod tests {
         // No network I/O should even be attempted for a token this crate
         // can already tell is malformed.
         let err = WsJoinTransport
-            .redeem(&server(), "not-a-valid-token", "kiwi", DebugLevel::None)
+            .redeem(&server(), "not-a-valid-token", "kiwi", DebugConfig::default())
             .unwrap_err();
         let JoinError::Failed(message) = err;
         assert!(message.contains("token_id"), "message: {message}");
@@ -358,7 +361,7 @@ mod tests {
         let server = ServerAddress::parse(&format!("ws://127.0.0.1:{port}")).unwrap();
 
         let err = WsJoinTransport
-            .redeem(&server, "tok_x:hlr_join_y", "kiwi", DebugLevel::None)
+            .redeem(&server, "tok_x:hlr_join_y", "kiwi", DebugConfig::default())
             .unwrap_err();
         let JoinError::Failed(message) = err;
         assert!(!message.is_empty());
