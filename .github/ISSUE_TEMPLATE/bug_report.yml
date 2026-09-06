@@ -1,0 +1,83 @@
+name: Bug report
+description: Report a problem with holler-client
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. AI-assisted investigation is welcome —
+        see [CONTRIBUTING.md](../../CONTRIBUTING.md) — but please verify the behavior
+        yourself before filing, and disclose AI assistance if you used it.
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: e.g. macOS 15.1, Ubuntu 24.04, Windows 11
+      placeholder: macOS 15.1
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: holler-client version / commit
+      description: >
+        `holler --version` isn't wired up yet (see issue #57), so give the git commit
+        or branch you built from, or the `version` field from Cargo.toml.
+      placeholder: git commit abc1234 on main, or Cargo.toml version 0.1.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The actual behavior you observed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-expected
+    attributes:
+      label: What you expected
+      description: The behavior you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro-steps
+    attributes:
+      label: Steps to reproduce
+      description: >
+        Concrete, runnable steps — not "it doesn't work sometimes." Include the exact
+        commands you ran.
+      placeholder: |
+        1. holler join --server ws://myhost.example.com:41807 --token <token_id>:<secret>
+        2. holler run --config sessions.toml
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output/logs
+      description: Paste any relevant terminal output or logs. This will be rendered as a code block.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: verification
+    attributes:
+      label: Verification
+      options:
+        - label: >
+            I have personally verified this behavior myself (reproduced it, or reviewed
+            the AI's reproduction and confirmed the evidence) — required to submit.
+          required: true
+        - label: This report was drafted with AI assistance.
+          required: false
