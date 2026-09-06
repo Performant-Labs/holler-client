@@ -5,12 +5,13 @@
 //! [`holler_client::join::WsJoinTransport`] and
 //! [`holler_client::connection`] respectively.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
-use holler_client::config::SessionRegistry;
+use holler_client::config;
 use holler_client::connection::{self, ConnectionStateStore, LiveState};
 use holler_client::credential::{CredentialStore, PersistedCredential};
 use holler_client::join::{JoinTransport, WsJoinTransport};
@@ -30,6 +31,12 @@ const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// Body config file (`[[session]]` entries). With no config, this
+    /// process has zero local sessions — every session is explicit, there
+    /// is no default.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -76,14 +83,17 @@ enum Command {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let config = cli.config.clone();
     let result = match cli.command {
         Command::Join { server, token } => run_join(&server, &token),
-        Command::Run => run_run(),
+        Command::Run => run_run(config.as_deref()),
         Command::Detach => run_detach(),
-        Command::Status => run_query_local("status", &[]),
-        Command::Support { feature } => run_query_local("support", std::slice::from_ref(&feature)),
-        Command::Caps => run_query_local("caps", &[]),
-        Command::Query { cmd, args } => run_query_local(&cmd, &args),
+        Command::Status => run_query_local("status", &[], config.as_deref()),
+        Command::Support { feature } => {
+            run_query_local("support", std::slice::from_ref(&feature), config.as_deref())
+        }
+        Command::Caps => run_query_local("caps", &[], config.as_deref()),
+        Command::Query { cmd, args } => run_query_local(&cmd, &args, config.as_deref()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -122,14 +132,14 @@ fn run_join(server: &str, token: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run_run() -> Result<(), String> {
+fn run_run(config: Option<&std::path::Path>) -> Result<(), String> {
     let store = CredentialStore::open().map_err(|e| e.to_string())?;
     let credential = store
         .load()
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "not joined; run `holler join` first".to_string())?;
 
-    let registry = SessionRegistry::defaults(&current_hostname());
+    let registry = config::load(config).map_err(|e| e.to_string())?;
     let state = ConnectionStateStore::open().map_err(|e| e.to_string())?;
     // A prior `run` in this state dir may have died without clearing a
     // detach marker or its own live-state file; start from a clean slate.
@@ -193,11 +203,15 @@ fn run_detach() -> Result<(), String> {
 /// (`crate::query::dispatch`), so `holler status` and a server's inbound
 /// `query`/`cmd=status` are provably the same document, not two
 /// independently-maintained ones.
-fn run_query_local(cmd: &str, args: &[String]) -> Result<(), String> {
+fn run_query_local(
+    cmd: &str,
+    args: &[String],
+    config: Option<&std::path::Path>,
+) -> Result<(), String> {
     let store = CredentialStore::open().map_err(|e| e.to_string())?;
     let credential = store.load().map_err(|e| e.to_string())?;
     let hostname = current_hostname();
-    let registry = SessionRegistry::defaults(&hostname);
+    let registry = config::load(config).map_err(|e| e.to_string())?;
     let live = ConnectionStateStore::open()
         .map(|s| s.current_state(connection::STALE_AFTER))
         .unwrap_or(LiveState::Disconnected);

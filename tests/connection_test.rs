@@ -38,13 +38,38 @@ struct Env {
     /// default, so `opencode` (or any other harness) reads as unconfirmed
     /// unless a test opts in via [`Env::with_fake_executable`].
     path_dir: tempfile::TempDir,
+    /// A body config (`--config`) declaring two `opencode` sessions,
+    /// `test-alpha`/`test-beta`. `SessionRegistry` has no built-in default
+    /// (every session is explicit) — this fixture is this test file's own
+    /// stand-in for "a body process with sessions configured", the same
+    /// role a shipped default used to play.
+    config_path: std::path::PathBuf,
 }
 
 impl Env {
     fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("holler.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[session]]
+name = "test-alpha"
+harness = "opencode"
+command = ["opencode", "acp"]
+
+[[session]]
+name = "test-beta"
+harness = "opencode"
+command = ["opencode", "acp"]
+"#,
+        )
+        .unwrap();
         Env {
-            dir: tempfile::tempdir().unwrap(),
-            path_dir: tempfile::tempdir().unwrap(),
+            dir,
+            path_dir,
+            config_path,
         }
     }
 
@@ -69,6 +94,7 @@ impl Env {
         let mut cmd = holler();
         cmd.env("HOLLER_STATE_DIR", self.dir.path());
         cmd.env("PATH", self.path_dir.path());
+        cmd.arg("--config").arg(&self.config_path);
         cmd
     }
 
@@ -76,7 +102,13 @@ impl Env {
     /// `holler join` (whose real network redeem doesn't exist yet; see
     /// module docs), since this story's scope is resuming with an
     /// already-persisted credential.
-    fn write_credential(&self, server_url: &str, credential: &str, client_id: &str, hostname: &str) {
+    fn write_credential(
+        &self,
+        server_url: &str,
+        credential: &str,
+        client_id: &str,
+        hostname: &str,
+    ) {
         let contents = serde_json::json!({
             "client_id": client_id,
             "credential": credential,
@@ -280,7 +312,9 @@ async fn auth_then_hello_round_trip_and_status_reports_connected() {
     send_envelope(&mut ws, &server_hello_envelope()).await;
 
     // The client's own `hello`, per spec §4 ("each side sends hello").
-    let client_hello = next_envelope(&mut ws).await.expect("expected client `hello`");
+    let client_hello = next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
     match client_hello.body {
         Body::Hello(hello) => {
             assert_eq!(hello.role, Role::Client);
@@ -308,10 +342,14 @@ async fn ping_from_server_is_answered_with_pong_including_hostname() {
     let mut ws = accept_ws(&listener).await;
     expect_auth(&mut ws).await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
-    next_envelope(&mut ws).await.expect("expected client `hello`"); // drain it
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`"); // drain it
 
     send_envelope(&mut ws, &ping_envelope()).await;
-    let reply = next_envelope(&mut ws).await.expect("expected a `pong` reply");
+    let reply = next_envelope(&mut ws)
+        .await
+        .expect("expected a `pong` reply");
     match reply.body {
         Body::Pong(pong) => assert_eq!(pong.hostname.as_deref(), Some("pong-host")),
         other => panic!("expected `pong`, got {other:?}"),
@@ -365,7 +403,10 @@ async fn wrong_credential_surfaces_as_a_clear_failure_not_a_retry_loop() {
 
     let status = wait_for_exit(&mut child, Duration::from_secs(5))
         .expect("`holler run` should exit promptly on an unauthenticated error, not retry forever");
-    assert!(!status.success(), "expected a non-zero exit for a rejected credential");
+    assert!(
+        !status.success(),
+        "expected a non-zero exit for a rejected credential"
+    );
 
     let mut stderr = String::new();
     child
@@ -378,7 +419,10 @@ async fn wrong_credential_surfaces_as_a_clear_failure_not_a_retry_loop() {
         stderr.to_lowercase().contains("authentication failed"),
         "stderr should clearly report the auth failure, got: {stderr:?}"
     );
-    assert!(!stderr.contains("hlr_live_bad"), "must never log the credential");
+    assert!(
+        !stderr.contains("hlr_live_bad"),
+        "must never log the credential"
+    );
 
     // The credential is left in place (an operator decision, not this
     // story's to make); the connection is not.
@@ -399,13 +443,17 @@ async fn detach_closes_a_live_connection_and_the_run_process_exits() {
     let mut ws = accept_ws(&listener).await;
     expect_auth(&mut ws).await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
-    next_envelope(&mut ws).await.expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
 
     env.wait_for_status(STATUS_BUDGET, |doc| doc["connected"] == true);
 
     let detach_out = env.cmd().arg("detach").output().unwrap();
     assert!(detach_out.status.success(), "{detach_out:?}");
-    assert!(String::from_utf8(detach_out.stdout).unwrap().contains("detached"));
+    assert!(String::from_utf8(detach_out.stdout)
+        .unwrap()
+        .contains("detached"));
 
     let status = wait_for_exit(&mut child, Duration::from_secs(5))
         .expect("`holler run` should exit once detach is requested");
@@ -426,11 +474,15 @@ async fn query_status_from_server_is_answered_with_the_real_status_document() {
     let mut ws = accept_ws(&listener).await;
     expect_auth(&mut ws).await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
-    next_envelope(&mut ws).await.expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
 
     let request = query_envelope("status", vec![]);
     send_envelope(&mut ws, &request).await;
-    let reply = next_envelope(&mut ws).await.expect("expected a `query_ok` reply");
+    let reply = next_envelope(&mut ws)
+        .await
+        .expect("expected a `query_ok` reply");
     assert_eq!(reply.id, request.id, "query_ok must reuse the request id");
     match reply.body {
         Body::QueryOk(body) => {
@@ -457,10 +509,18 @@ async fn query_support_reports_true_for_an_implemented_protocol_feature() {
     let mut ws = accept_ws(&listener).await;
     expect_auth(&mut ws).await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
-    next_envelope(&mut ws).await.expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
 
-    send_envelope(&mut ws, &query_envelope("support", vec!["ping".to_string()])).await;
-    let reply = next_envelope(&mut ws).await.expect("expected a `query_ok` reply");
+    send_envelope(
+        &mut ws,
+        &query_envelope("support", vec!["ping".to_string()]),
+    )
+    .await;
+    let reply = next_envelope(&mut ws)
+        .await
+        .expect("expected a `query_ok` reply");
     match reply.body {
         Body::QueryOk(body) => {
             assert_eq!(body["ok"], true);
@@ -484,10 +544,18 @@ async fn query_support_reports_true_for_confirmed_runnable_harness() {
     let mut ws = accept_ws(&listener).await;
     expect_auth(&mut ws).await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
-    next_envelope(&mut ws).await.expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
 
-    send_envelope(&mut ws, &query_envelope("support", vec!["opencode".to_string()])).await;
-    let reply = next_envelope(&mut ws).await.expect("expected a `query_ok` reply");
+    send_envelope(
+        &mut ws,
+        &query_envelope("support", vec!["opencode".to_string()]),
+    )
+    .await;
+    let reply = next_envelope(&mut ws)
+        .await
+        .expect("expected a `query_ok` reply");
     match reply.body {
         Body::QueryOk(body) => {
             assert_eq!(body["ok"], true);
@@ -503,7 +571,7 @@ async fn query_support_reports_true_for_confirmed_runnable_harness() {
 #[tokio::test]
 async fn query_support_reports_false_for_a_harness_not_on_path() {
     // No `with_fake_executable`: the default env's `$PATH` is an empty
-    // tempdir, so `opencode` — configured by `SessionRegistry::defaults()`
+    // tempdir, so `opencode` — configured by `Env`'s fixture `--config`
     // — is not confirmed runnable, even though it *is* configured.
     let env = Env::new();
     let (listener, url) = bind_local().await;
@@ -514,10 +582,18 @@ async fn query_support_reports_false_for_a_harness_not_on_path() {
     let mut ws = accept_ws(&listener).await;
     expect_auth(&mut ws).await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
-    next_envelope(&mut ws).await.expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
 
-    send_envelope(&mut ws, &query_envelope("support", vec!["opencode".to_string()])).await;
-    let reply = next_envelope(&mut ws).await.expect("expected a `query_ok` reply");
+    send_envelope(
+        &mut ws,
+        &query_envelope("support", vec!["opencode".to_string()]),
+    )
+    .await;
+    let reply = next_envelope(&mut ws)
+        .await
+        .expect("expected a `query_ok` reply");
     match reply.body {
         Body::QueryOk(body) => {
             assert_eq!(body["ok"], false);
@@ -541,10 +617,14 @@ async fn query_caps_reports_a_capability_entry_for_every_known_id() {
     let mut ws = accept_ws(&listener).await;
     expect_auth(&mut ws).await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
-    next_envelope(&mut ws).await.expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
 
     send_envelope(&mut ws, &query_envelope("caps", vec![])).await;
-    let reply = next_envelope(&mut ws).await.expect("expected a `query_ok` reply");
+    let reply = next_envelope(&mut ws)
+        .await
+        .expect("expected a `query_ok` reply");
     match reply.body {
         Body::QueryOk(body) => {
             assert_eq!(body["cmd"], "caps");
@@ -569,10 +649,14 @@ async fn query_protocol_with_no_args_reports_this_binarys_min_max() {
     let mut ws = accept_ws(&listener).await;
     expect_auth(&mut ws).await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
-    next_envelope(&mut ws).await.expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
 
     send_envelope(&mut ws, &query_envelope("protocol", vec![])).await;
-    let reply = next_envelope(&mut ws).await.expect("expected a `query_ok` reply");
+    let reply = next_envelope(&mut ws)
+        .await
+        .expect("expected a `query_ok` reply");
     match reply.body {
         Body::QueryOk(body) => {
             assert_eq!(body["cmd"], "protocol");
@@ -597,10 +681,14 @@ async fn query_protocol_with_arg_answers_can_you_speak_n() {
     let mut ws = accept_ws(&listener).await;
     expect_auth(&mut ws).await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
-    next_envelope(&mut ws).await.expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
 
     send_envelope(&mut ws, &query_envelope("protocol", vec!["2".to_string()])).await;
-    let reply = next_envelope(&mut ws).await.expect("expected a `query_ok` reply");
+    let reply = next_envelope(&mut ws)
+        .await
+        .expect("expected a `query_ok` reply");
     match reply.body {
         Body::QueryOk(body) => {
             assert_eq!(body["ok"], false);
@@ -624,11 +712,15 @@ async fn query_unknown_cmd_fails_closed_with_error_reply() {
     let mut ws = accept_ws(&listener).await;
     expect_auth(&mut ws).await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
-    next_envelope(&mut ws).await.expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
 
     let request = query_envelope("summarize", vec![]);
     send_envelope(&mut ws, &request).await;
-    let reply = next_envelope(&mut ws).await.expect("expected an `error` reply");
+    let reply = next_envelope(&mut ws)
+        .await
+        .expect("expected an `error` reply");
     assert_eq!(reply.id, request.id, "error must reuse the request id");
     match reply.body {
         Body::Error(ErrorBody { code, cmd, .. }) => {
@@ -654,11 +746,17 @@ async fn hello_advertises_harness_only_when_confirmed_runnable() {
     let mut ws = accept_ws(&listener).await;
     expect_auth(&mut ws).await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
-    let client_hello = next_envelope(&mut ws).await.expect("expected client `hello`");
+    let client_hello = next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
     match client_hello.body {
         Body::Hello(hello) => {
             assert_eq!(hello.harnesses, vec!["opencode".to_string()]);
-            assert_eq!(hello.sessions.len(), 2, "both default sessions use the confirmed harness");
+            assert_eq!(
+                hello.sessions.len(),
+                2,
+                "both configured sessions use the confirmed harness"
+            );
             assert!(hello.features.contains(&"query".to_string()));
         }
         other => panic!("expected `hello`, got {other:?}"),
@@ -681,7 +779,9 @@ async fn hello_advertises_no_harness_when_not_confirmed_runnable() {
     let mut ws = accept_ws(&listener).await;
     expect_auth(&mut ws).await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
-    let client_hello = next_envelope(&mut ws).await.expect("expected client `hello`");
+    let client_hello = next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
     match client_hello.body {
         Body::Hello(hello) => {
             assert!(hello.harnesses.is_empty());
