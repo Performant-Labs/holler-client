@@ -20,7 +20,7 @@
 //!
 //! A join envelope's `from` is the join token's public `token_id` (spec
 //! §4.1) — a value distinct from the secret and not derivable from it.
-//! holler-server's `holler token mint` prints both separately (`token_id:
+//! holler-server's `holler-server token mint` prints both separately (`token_id:
 //! tok_...` / `secret: hlr_...`), and this crate's `holler join --token`
 //! flag (issue #23) takes a single string. Rather than add a second CLI
 //! flag, this crate treats that one pasted value as
@@ -139,7 +139,7 @@ impl JoinTransport for StubJoinTransport {
 fn split_token_id_and_secret(token: &str) -> Result<(&str, &str), JoinError> {
     token.split_once(':').ok_or_else(|| {
         JoinError::Failed(
-            "expected `--token <token_id>:<secret>` (both printed by `holler token mint`)"
+            "expected `--token <token_id>:<secret>` (both printed by `holler-server token mint`)"
                 .to_string(),
         )
     })

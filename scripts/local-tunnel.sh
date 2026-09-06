@@ -11,7 +11,7 @@
 set -euo pipefail
 
 if [ -z "${HOLLER_SERVER_HOST:-}" ]; then
-  echo "error: HOLLER_SERVER_HOST is not set — export it to the remote host running holler serve (e.g. HOLLER_SERVER_HOST=io)" >&2
+  echo "error: HOLLER_SERVER_HOST is not set — export it to the remote host running holler-server serve (e.g. HOLLER_SERVER_HOST=io)" >&2
   exit 1
 fi
 

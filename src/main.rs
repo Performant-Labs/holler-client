@@ -66,7 +66,7 @@ enum Command {
         #[arg(long)]
         server: String,
         /// One-time join token, as `<token_id>:<secret>` (both printed by
-        /// `holler token mint` on the server). Never persisted or sent
+        /// `holler-server token mint` on the server). Never persisted or sent
         /// again after this call.
         #[arg(long)]
         token: String,
