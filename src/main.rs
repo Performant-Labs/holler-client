@@ -38,7 +38,7 @@ const DETACH_WAIT_BUDGET: Duration = Duration::from_secs(3);
 const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Parser)]
-#[command(name = "holler", about = "Thin client for the Holler talk circuit")]
+#[command(name = "holler", version, about = "Thin client for the Holler talk circuit")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
