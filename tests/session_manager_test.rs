@@ -210,6 +210,68 @@ async fn interrupt_during_queued_prompt_only_cancels_current_turn_and_queue_stil
 }
 
 #[tokio::test]
+async fn is_busy_reflects_turn_in_flight() {
+    let manager = spawn_manager(&["alpha"]).await;
+
+    assert!(!manager.is_busy("alpha").await.unwrap());
+
+    manager.prompt("alpha", "hello").expect("prompt should send");
+    // Flips synchronously, inside the session's background task, the
+    // moment the prompt is forwarded to the driver -- see module docs on
+    // simulating "long turn" without wall-clock delays.
+    assert!(manager.is_busy("alpha").await.unwrap());
+
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn is_busy_on_unknown_session_is_a_well_defined_error() {
+    let manager = spawn_manager(&["alpha"]).await;
+
+    let err = manager
+        .is_busy("nonexistent")
+        .await
+        .expect_err("unknown session name must error, not panic");
+    assert!(matches!(err, ManagerError::UnknownSession(name) if name == "nonexistent"));
+
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn session_names_lists_every_spawned_session() {
+    let manager = spawn_manager(&["alpha", "beta"]).await;
+
+    let mut names = manager.session_names();
+    names.sort();
+    assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
+
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn take_event_channels_drains_events_independently_per_session() {
+    let mut manager = spawn_manager(&["alpha", "beta"]).await;
+    let mut channels = manager.take_event_channels();
+    assert_eq!(channels.len(), 2);
+
+    // Taken channels are no longer reachable through `next_event`.
+    assert_eq!(manager.next_event("alpha").await.unwrap(), None);
+
+    manager.prompt("alpha", "hello").expect("prompt should send");
+    let event = channels
+        .get_mut("alpha")
+        .expect("alpha channel was taken")
+        .recv()
+        .await;
+    assert_eq!(event, Some(DriverEvent::Status(DriverStatus::Working)));
+
+    // beta's channel is untouched by alpha's traffic.
+    assert!(channels.get_mut("beta").unwrap().try_recv().is_err());
+
+    manager.shutdown().await;
+}
+
+#[tokio::test]
 async fn unknown_session_is_a_well_defined_error_not_a_panic() {
     let manager = spawn_manager(&["alpha"]).await;
 

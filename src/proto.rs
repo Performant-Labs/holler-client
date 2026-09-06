@@ -9,12 +9,12 @@
 //! independently, not imported.
 //!
 //! `query` / `query_ok` are added here too (issue #30: answer `status` /
-//! `caps` / `support` / `protocol`). Every other v1 type (`prompt`,
-//! `reply`, `interrupt`, `presence`, `ack`) still decodes to
-//! [`Body::Unknown`] rather than failing — this story does not implement
-//! prompt routing, so a server that sends one of those must not crash or
-//! wedge this connection — it is simply a frame this binary does not act
-//! on yet.
+//! `caps` / `support` / `protocol`). `prompt`, `reply`, `interrupt`,
+//! `presence`, `ack` are added by issue #49 (`crate::connection`'s inbound
+//! dispatch and outbound presence/reply/ack wiring). Any *other* v1 type
+//! still decodes to [`Body::Unknown`] rather than failing — a frame this
+//! binary genuinely doesn't understand must not crash or wedge the
+//! connection.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,6 +34,15 @@ pub const CODE_JOIN_FAILED: &str = "join_failed";
 /// `support` asked with no argument, or `protocol`'s argument isn't a
 /// positive integer (spec §7, §11).
 pub const CODE_UNKNOWN_FEATURE: &str = "unknown_feature";
+/// `prompt`/`interrupt` names a session this client does not host (spec §11).
+pub const CODE_UNKNOWN_SESSION: &str = "unknown_session";
+/// A session this client does host, but whose driver connection has
+/// already ended (or whose interrupt could not be delivered by any
+/// channel) — not in the spec's error table, which only names
+/// `unknown_session` for this pair of message types. Added here rather
+/// than silently dropping the frame or misreporting a live session as
+/// unknown (issue #49's "not a silent drop or panic" requirement).
+pub const CODE_SESSION_UNAVAILABLE: &str = "session_unavailable";
 
 /// Who is speaking (spec §6).
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -67,9 +76,18 @@ pub enum MessageType {
     Query,
     #[serde(rename = "query_ok")]
     QueryOk,
-    /// Any other v1 type (`prompt`, `reply`, `interrupt`, `presence`,
-    /// `ack`). Carries the original wire string so a log line can still
-    /// name it.
+    #[serde(rename = "prompt")]
+    Prompt,
+    #[serde(rename = "reply")]
+    Reply,
+    #[serde(rename = "interrupt")]
+    Interrupt,
+    #[serde(rename = "presence")]
+    Presence,
+    #[serde(rename = "ack")]
+    Ack,
+    /// Any other v1 type. Carries the original wire string so a log line
+    /// can still name it.
     #[serde(other)]
     Unknown,
 }
@@ -86,6 +104,11 @@ impl MessageType {
             "error" => Self::Error,
             "query" => Self::Query,
             "query_ok" => Self::QueryOk,
+            "prompt" => Self::Prompt,
+            "reply" => Self::Reply,
+            "interrupt" => Self::Interrupt,
+            "presence" => Self::Presence,
+            "ack" => Self::Ack,
             _ => Self::Unknown,
         }
     }
@@ -101,6 +124,11 @@ impl MessageType {
             Self::Error => "error",
             Self::Query => "query",
             Self::QueryOk => "query_ok",
+            Self::Prompt => "prompt",
+            Self::Reply => "reply",
+            Self::Interrupt => "interrupt",
+            Self::Presence => "presence",
+            Self::Ack => "ack",
             Self::Unknown => "unknown",
         }
     }
@@ -207,6 +235,58 @@ pub struct QueryBody {
     pub args: Vec<String>,
 }
 
+/// `prompt` body (spec §10): server asks this client to prompt a named
+/// local session.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct PromptBody {
+    pub session: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+/// `reply` body (spec §10): this client's session output / turn result,
+/// streamed as one frame per [`crate::acp_driver::DriverEvent::Update`]
+/// plus a final `done: true` frame on
+/// [`crate::acp_driver::DriverEvent::StopReason`].
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct ReplyBody {
+    pub session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chunks: Vec<String>,
+    #[serde(default)]
+    pub done: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<i64>,
+}
+
+/// `interrupt` body (spec §10): cancel the named session's current turn;
+/// the session itself remains promptable (ADR 0005).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct InterruptBody {
+    pub session: String,
+}
+
+/// `presence` body (spec §10): this client's session advertise +
+/// heartbeat. The spec leaves each session row's shape open beyond
+/// "sessions" — this client uses the same `{name, harness, busy}` shape
+/// [`crate::status::SessionStatus`] already reports for `holler status`,
+/// so there is exactly one definition of what a session row looks like.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct PresenceBody {
+    pub sessions: Vec<Value>,
+}
+
+/// `ack` body (spec §10): optional receipt referencing the acknowledged
+/// frame's id.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+pub struct AckBody {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub of: Option<String>,
+}
+
 /// One body variant per [`MessageType`], plus [`Body::Unknown`] for any
 /// v1 type this client doesn't act on yet (see module docs).
 #[derive(Clone, PartialEq, Debug)]
@@ -227,8 +307,13 @@ pub enum Body {
     /// remote `query` of its own — see `crate::query` module docs), so
     /// there's no round-trip need for a typed variant here.
     QueryOk(Value),
-    /// An undecoded frame body of a type this client doesn't implement
-    /// (e.g. `prompt`), kept as raw JSON so nothing is lost from a log.
+    Prompt(PromptBody),
+    Reply(ReplyBody),
+    Interrupt(InterruptBody),
+    Presence(PresenceBody),
+    Ack(AckBody),
+    /// An undecoded frame body of a type this client doesn't implement,
+    /// kept as raw JSON so nothing is lost from a log.
     Unknown(Value),
 }
 
@@ -267,6 +352,11 @@ pub fn encode(envelope: &Envelope) -> serde_json::Result<String> {
         Body::Error(b) => serde_json::to_value(b)?,
         Body::Query(b) => serde_json::to_value(b)?,
         Body::QueryOk(v) => v.clone(),
+        Body::Prompt(b) => serde_json::to_value(b)?,
+        Body::Reply(b) => serde_json::to_value(b)?,
+        Body::Interrupt(b) => serde_json::to_value(b)?,
+        Body::Presence(b) => serde_json::to_value(b)?,
+        Body::Ack(b) => serde_json::to_value(b)?,
         Body::Unknown(v) => v.clone(),
     };
     let out = serde_json::json!({
@@ -355,6 +445,26 @@ pub fn decode(raw: &str) -> Result<Envelope, DecodeError> {
                 .map_err(|e| DecodeError::Malformed(format!("bad `query` body: {e}")))?,
         ),
         MessageType::QueryOk => Body::QueryOk(raw_body),
+        MessageType::Prompt => Body::Prompt(
+            serde_json::from_value(raw_body)
+                .map_err(|e| DecodeError::Malformed(format!("bad `prompt` body: {e}")))?,
+        ),
+        MessageType::Reply => Body::Reply(
+            serde_json::from_value(raw_body)
+                .map_err(|e| DecodeError::Malformed(format!("bad `reply` body: {e}")))?,
+        ),
+        MessageType::Interrupt => Body::Interrupt(
+            serde_json::from_value(raw_body)
+                .map_err(|e| DecodeError::Malformed(format!("bad `interrupt` body: {e}")))?,
+        ),
+        MessageType::Presence => Body::Presence(
+            serde_json::from_value(raw_body)
+                .map_err(|e| DecodeError::Malformed(format!("bad `presence` body: {e}")))?,
+        ),
+        MessageType::Ack => Body::Ack(
+            serde_json::from_value(raw_body)
+                .map_err(|e| DecodeError::Malformed(format!("bad `ack` body: {e}")))?,
+        ),
         MessageType::Unknown => Body::Unknown(raw_body),
     };
 
@@ -502,6 +612,69 @@ pub fn query_ok_reply(reply_id: &str, from: &str, body: Value) -> Envelope {
         ts: now_ts(),
         from: from.to_string(),
         body: Body::QueryOk(body),
+    }
+}
+
+/// This client's `presence` (spec §10): session advertise + heartbeat,
+/// sent once right after this client's own `hello` on every (re)connect
+/// (issue #49; holler-server issue #52 — never assumes anything survived
+/// a drop). `sessions` rows are pre-built JSON (see
+/// [`crate::connection`]'s use of [`crate::status::SessionStatus`]) rather
+/// than a typed parameter here, since the spec leaves the row shape open.
+pub fn client_presence(from: &str, sessions: Vec<Value>) -> Envelope {
+    Envelope {
+        v: PROTOCOL_VERSION,
+        msg_type: MessageType::Presence,
+        id: new_id(),
+        ts: now_ts(),
+        from: from.to_string(),
+        body: Body::Presence(PresenceBody { sessions }),
+    }
+}
+
+/// This client's `reply` to an inbound `prompt` (spec §10). Reuses the
+/// originating `prompt`'s envelope `id` for every chunk of one turn (spec
+/// §3: "Replies reuse the request id"), including the final `done: true`
+/// frame.
+pub fn reply(
+    reply_id: &str,
+    from: &str,
+    session: &str,
+    text: Option<String>,
+    chunks: Vec<String>,
+    done: bool,
+) -> Envelope {
+    Envelope {
+        v: PROTOCOL_VERSION,
+        msg_type: MessageType::Reply,
+        id: reply_id.to_string(),
+        ts: now_ts(),
+        from: from.to_string(),
+        body: Body::Reply(ReplyBody {
+            session: session.to_string(),
+            text,
+            chunks,
+            done,
+            exit: None,
+        }),
+    }
+}
+
+/// This client's `ack` of an inbound `interrupt`, sent once the
+/// cancellation has actually been applied (issue #49) — never merely
+/// once the frame was parsed. Reuses the interrupt's envelope `id` (spec
+/// §3) and also names it via `body.of`, since `ack`'s whole job is being
+/// a receipt for a specific earlier frame.
+pub fn ack_reply(reply_id: &str, from: &str) -> Envelope {
+    Envelope {
+        v: PROTOCOL_VERSION,
+        msg_type: MessageType::Ack,
+        id: reply_id.to_string(),
+        ts: now_ts(),
+        from: from.to_string(),
+        body: Body::Ack(AckBody {
+            of: Some(reply_id.to_string()),
+        }),
     }
 }
 
@@ -655,12 +828,93 @@ mod tests {
 
     #[test]
     fn unknown_type_decodes_instead_of_erroring() {
-        // `prompt` is real v1 vocabulary (spec §5) but not yet implemented
-        // by this client (prompt routing is a later story) — `query` is
-        // now a known type, so it can't stand in for "unrecognized" here.
-        let raw = r#"{"v":1,"type":"prompt","id":"x","ts":"t","from":"server","body":{"session":"alpha","text":"hi"}}"#;
+        let raw =
+            r#"{"v":1,"type":"wave","id":"x","ts":"t","from":"server","body":{"anything":true}}"#;
         let decoded = decode(raw).unwrap();
         assert!(matches!(decoded.body, Body::Unknown(_)));
+    }
+
+    #[test]
+    fn prompt_round_trips() {
+        let raw = r#"{"v":1,"type":"prompt","id":"req-p1","ts":"t","from":"server","body":{"session":"alpha","text":"hi"}}"#;
+        let decoded = decode(raw).unwrap();
+        match decoded.body {
+            Body::Prompt(PromptBody {
+                session,
+                text,
+                meta,
+            }) => {
+                assert_eq!(session, "alpha");
+                assert_eq!(text, "hi");
+                assert_eq!(meta, None);
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interrupt_round_trips() {
+        let raw = r#"{"v":1,"type":"interrupt","id":"req-i1","ts":"t","from":"server","body":{"session":"alpha"}}"#;
+        let decoded = decode(raw).unwrap();
+        match decoded.body {
+            Body::Interrupt(InterruptBody { session }) => assert_eq!(session, "alpha"),
+            other => panic!("expected Interrupt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reply_round_trips_and_reuses_request_id() {
+        let env = reply(
+            "req-p1",
+            "cli_1",
+            "alpha",
+            Some("hello there".to_string()),
+            vec![],
+            false,
+        );
+        assert_eq!(env.id, "req-p1");
+        let raw = encode(&env).unwrap();
+        let decoded = decode(&raw).unwrap();
+        match decoded.body {
+            Body::Reply(ReplyBody {
+                session,
+                text,
+                done,
+                exit,
+                ..
+            }) => {
+                assert_eq!(session, "alpha");
+                assert_eq!(text.as_deref(), Some("hello there"));
+                assert!(!done);
+                assert_eq!(exit, None);
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn presence_round_trips_with_session_rows() {
+        let rows = vec![serde_json::json!({"name": "alpha", "harness": "opencode", "busy": false})];
+        let env = client_presence("cli_1", rows.clone());
+        let raw = encode(&env).unwrap();
+        let decoded = decode(&raw).unwrap();
+        match decoded.body {
+            Body::Presence(PresenceBody { sessions }) => assert_eq!(sessions, rows),
+            other => panic!("expected Presence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ack_reply_reuses_interrupt_id_and_names_it_via_of() {
+        let env = ack_reply("req-i1", "cli_1");
+        assert_eq!(env.id, "req-i1");
+        match &env.body {
+            Body::Ack(AckBody { of }) => assert_eq!(of.as_deref(), Some("req-i1")),
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        let raw = encode(&env).unwrap();
+        let decoded = decode(&raw).unwrap();
+        assert_eq!(decoded, env);
     }
 
     #[test]

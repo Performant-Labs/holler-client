@@ -29,13 +29,15 @@ use crate::proto::{self, QueryBody};
 use crate::status;
 
 /// Protocol features this binary actually implements right now. Spec §9's
-/// full vocabulary is [`KNOWN_PROTOCOL_FEATURES`] — most of it is not wired
-/// to the wire yet. `interrupt` and `presence` exist as local Rust APIs
-/// ([`crate::session_manager`]) but are not yet reachable from a live
-/// socket ([`crate::connection`]'s inbound dispatch only understands
-/// `ping`/`query`), so advertising them here would violate "advertise only
+/// full vocabulary is [`KNOWN_PROTOCOL_FEATURES`] — `roster`, `token`, and
+/// `wait` are not wired yet. `interrupt` and `presence` (issue #49) are
+/// genuinely reachable from a live socket now: [`crate::connection`]'s
+/// inbound dispatch routes `prompt`/`interrupt` to
+/// [`crate::session_manager::SessionManager`] and streams replies/acks
+/// back, and every (re)connect sends a real `presence` frame built from
+/// that same manager's state — so both belong here per "advertise only
 /// what is real" (ADR-0001).
-pub const CLIENT_FEATURES: &[&str] = &["ping", "query"];
+pub const CLIENT_FEATURES: &[&str] = &["ping", "query", "interrupt", "presence"];
 
 /// The v1 protocol feature vocabulary (spec §9).
 pub const KNOWN_PROTOCOL_FEATURES: &[&str] =
