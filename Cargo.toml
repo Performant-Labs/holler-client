@@ -36,7 +36,20 @@ toml = "0.8"
 # Issue #24: the live WebSocket session (`holler run`). Same crate and
 # version as holler-server's own choice (its Cargo.toml), so both sides of
 # the circuit exercise the same WebSocket implementation.
-tokio-tungstenite = "0.30.0"
+#
+# Issue #65: `rustls-tls-native-roots` is required for `--server wss://...`
+# to work at all — with no TLS feature enabled, connect_async() fails every
+# wss:// dial with "TLS support not compiled in". rustls-tls (pure Rust) is
+# preferred over native-tls per ADR-0010 (no OpenSSL/system-dependency
+# friction on GitHub-hosted macOS/Windows runners).
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
+# Issue #65: rustls 0.23 does not auto-select a crypto provider even with
+# rustls-tls-native-roots enabled above — without an explicit provider
+# feature, the first TLS handshake panics at runtime ("Could not
+# automatically determine the process-level CryptoProvider"). `ring` is
+# the lighter-weight, pure-Rust-friendly choice of the two providers
+# rustls supports.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 futures-util = { version = "0.3.34", features = ["sink"] }
 # RFC 3339 envelope timestamps (`ts`), same crate as holler-server's own
 # `hello.rs` uses for the same purpose — avoids hand-rolling date math for
