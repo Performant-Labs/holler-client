@@ -9,16 +9,16 @@ jobs:
   test:
     strategy:
       fail-fast: false
+      # Windows is deliberately OFF the matrix (not soft-failed) as of
+      # 2026-09-06 -- `src/instance_lock.rs` (issue #52) unconditionally
+      # imports `std::os::unix::io::AsRawFd`, which does not exist on
+      # Windows, so this crate currently fails to *compile* there. This
+      # is real, tracked work (holler-client#60), not something to leave
+      # as permanent CI noise until it's addressed. Add `windows-latest`
+      # back to this list once that's fixed.
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # Linux and macOS are required. Windows is allowed to be red for now —
-    # `src/instance_lock.rs` (issue #52) unconditionally imports
-    # `std::os::unix::io::AsRawFd`, which does not exist on Windows, so
-    # this crate currently fails to *compile* there (not a flaky test,
-    # unlike holler-server's Windows exception). Tracked as its own issue;
-    # remove this once that's fixed.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     steps:
       - uses: actions/checkout@v4
 
