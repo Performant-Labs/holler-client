@@ -51,15 +51,20 @@ Other commands, run locally on this machine (no live `run` process required for 
 
 ### Dev scripts
 
-Wraps the connect side of a manual cross-machine test (tunnel + run) per the org's `object:sub-object:verb` script-naming convention ([`Performant-Labs/playbook`](https://github.com/Performant-Labs/playbook/blob/main/frameworks/node/npm-scripts.md)), adapted for a Rust crate with no `package.json` — command names map to plain shell scripts:
+Wraps the connect side of a manual cross-machine test (tunnel + run) per the org's `object:sub-object:verb` script-naming convention ([`Performant-Labs/playbook`](https://github.com/Performant-Labs/playbook/blob/main/frameworks/node/npm-scripts.md)). This crate has no `package.json`, so `./scripts/run <name>` is the `npm run <name>` equivalent — the actual command you type, not just a documented mapping:
 
-| Command name | Script | Does |
-|---|---|---|
-| `app:local:tunnel` | `scripts/local-tunnel.sh` | Open the SSH tunnel to `$HOLLER_SERVER_HOST`'s loopback `holler serve` port (required until `wss` lands — see holler-server ADR 0004/0010); no-ops if something already owns the port |
-| `app:local:run` | `scripts/local-run.sh` | Build, then `holler run --debug=noisy` in the foreground against `session.toml`/`sessions.toml` (or `$HOLLER_CONFIG`). Requires an existing `holler join` — its own error tells you the command if not |
-| `app:local:stop` | `scripts/local-stop.sh` | `holler detach`, then close the tunnel from `app:local:tunnel` |
+```
+HOLLER_SERVER_HOST=io ./scripts/run app:local:tunnel
+./scripts/run app:local:run
+```
 
-`--debug=noisy` is the default for `app:local:run` deliberately — this is the dev/test entry point, and full frame visibility (secrets already redacted) is exactly what you want here.
+| Command name | Does |
+|---|---|
+| `app:local:tunnel` | Open the SSH tunnel to `$HOLLER_SERVER_HOST`'s loopback `holler serve` port (required until `wss` lands — see holler-server ADR 0004/0010); no-ops if something already owns the port |
+| `app:local:run` | Build, then `holler run --debug=noisy` in the foreground against `session.toml`/`sessions.toml` (or `$HOLLER_CONFIG`). Requires an existing `holler join` — its own error tells you the command if not |
+| `app:local:stop` | `holler detach`, then close the tunnel from `app:local:tunnel` |
+
+Each maps to a same-named `scripts/local-*.sh` file if you'd rather call the script directly. `--debug=noisy` is the default for `app:local:run` deliberately — this is the dev/test entry point, and full frame visibility (secrets already redacted) is exactly what you want here.
 
 ## Architecture
 
