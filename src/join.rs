@@ -1,4 +1,5 @@
-//! The join redeem seam (issue #23).
+//! The join redeem seam (issue #23), with a real transport (ADR 0015,
+//! issue #16's client-side follow-up).
 //!
 //! `holler join` exchanges a one-time join token for a durable client
 //! identity: a `client_id` and a long-lived credential (mirroring, without
@@ -7,15 +8,31 @@
 //! itself is single-use and is never sent, logged, or persisted again once
 //! this exchange completes.
 //!
-//! The real exchange is a WebSocket round-trip (`auth` / `hello`) against
-//! holler-server, which does not exist in this crate yet — that is issue
-//! #24 ("first talk"). [`JoinTransport`] is the seam: this story wires
-//! everything around it (CLI, URL/port handling, hostname, credential
-//! persistence) against the trait, and [`StubJoinTransport`] stands in
-//! until #24 replaces it with a real implementation. This mirrors the
-//! `ConnectionProbe` / `AlwaysDisconnected` seam in holler-server's
-//! `src/token/mod.rs` (issue #29/#31).
+//! The real exchange is a dedicated `join` / `join_ok` wire frame pair
+//! (`docs/protocol/v1.md` §4.1, holler-server ADR 0015): connect, send
+//! `join` as the first frame, await `join_ok` or `error`, then close — a
+//! one-shot bootstrap, never continuing into `auth`/`hello` on the same
+//! socket. [`WsJoinTransport`] is that real implementation. [`JoinTransport`]
+//! remains the seam and [`StubJoinTransport`] remains as a test double for
+//! callers (e.g. issue #23's own tests) that don't want a real socket.
+//!
+//! # `--token` is `<token_id>:<secret>`
+//!
+//! A join envelope's `from` is the join token's public `token_id` (spec
+//! §4.1) — a value distinct from the secret and not derivable from it.
+//! holler-server's `holler token mint` prints both separately (`token_id:
+//! tok_...` / `secret: hlr_...`), and this crate's `holler join --token`
+//! flag (issue #23) takes a single string. Rather than add a second CLI
+//! flag, this crate treats that one pasted value as
+//! `<token_id>:<secret>` — a single copy-pasted artifact, matching how a
+//! join token is described throughout this crate's docs and
+//! `docs/adr/ADR-0003.md`'s existing `--token <join>` CLI shape (which
+//! doesn't get a new flag added to it). See [`split_token_id_and_secret`].
 
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+
+use crate::proto::{self, Body, ErrorBody};
 use crate::server_address::ServerAddress;
 
 /// The durable identity returned by a successful join redeem.
@@ -101,6 +118,104 @@ impl JoinTransport for StubJoinTransport {
     }
 }
 
+/// Splits a `holler join --token` value into its `token_id` and `secret`
+/// parts (see module docs). Splits on the *first* colon only — neither
+/// part is expected to contain one, but the secret is the operator's
+/// pasted data and the token_id is not, so if anything is ambiguous it
+/// should be the tail, not the head.
+fn split_token_id_and_secret(token: &str) -> Result<(&str, &str), JoinError> {
+    token.split_once(':').ok_or_else(|| {
+        JoinError::Failed(
+            "expected `--token <token_id>:<secret>` (both printed by `holler token mint`)"
+                .to_string(),
+        )
+    })
+}
+
+/// The real [`JoinTransport`]: a one-shot WebSocket round-trip against
+/// holler-server's `join`/`join_ok` frame pair (`docs/protocol/v1.md`
+/// §4.1; ADR 0015). This is the production default for `holler join` —
+/// see `src/main.rs`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WsJoinTransport;
+
+impl JoinTransport for WsJoinTransport {
+    fn redeem(
+        &self,
+        server: &ServerAddress,
+        token: &str,
+        hostname: &str,
+    ) -> Result<RedeemedIdentity, JoinError> {
+        let (token_id, secret) = split_token_id_and_secret(token)?;
+
+        let runtime = tokio::runtime::Runtime::new().map_err(|e| {
+            JoinError::Failed(format!("failed to start async runtime for join: {e}"))
+        })?;
+        runtime.block_on(redeem_async(server, token_id, secret, hostname))
+    }
+}
+
+/// The actual connect → `join` → `join_ok`/`error` → close exchange behind
+/// [`WsJoinTransport::redeem`].
+async fn redeem_async(
+    server: &ServerAddress,
+    token_id: &str,
+    secret: &str,
+    hostname: &str,
+) -> Result<RedeemedIdentity, JoinError> {
+    let url = server.to_canonical_url();
+    let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .map_err(|e| JoinError::Failed(format!("connect to {url} failed: {e}")))?;
+
+    let envelope = proto::join_envelope(token_id, secret, hostname);
+    let raw = proto::encode(&envelope).expect("v1 join envelope always serializes");
+    if let Err(e) = ws.send(Message::Text(raw.into())).await {
+        return Err(JoinError::Failed(format!("failed to send join: {e}")));
+    }
+
+    let reply_raw = match ws.next().await {
+        Some(Ok(Message::Text(t))) => t.to_string(),
+        Some(Ok(_)) => {
+            let _ = ws.close(None).await;
+            return Err(JoinError::Failed(
+                "unexpected non-text frame while awaiting join_ok".to_string(),
+            ));
+        }
+        Some(Err(e)) => {
+            let _ = ws.close(None).await;
+            return Err(JoinError::Failed(format!(
+                "socket error awaiting join_ok: {e}"
+            )));
+        }
+        None => {
+            return Err(JoinError::Failed(
+                "connection closed awaiting join_ok".to_string(),
+            ))
+        }
+    };
+
+    // The server closes right after replying (spec §4.1); close our end
+    // too rather than leaving a one-shot socket open.
+    let _ = ws.close(None).await;
+
+    let reply = proto::decode(&reply_raw)
+        .map_err(|e| JoinError::Failed(format!("malformed frame awaiting join_ok: {e}")))?;
+    match reply.body {
+        Body::JoinOk(body) => Ok(RedeemedIdentity {
+            client_id: body.client_id,
+            credential: body.credential,
+        }),
+        Body::Error(ErrorBody { code, message, .. }) => Err(JoinError::Failed(
+            message.unwrap_or_else(|| format!("join failed ({code})")),
+        )),
+        other => Err(JoinError::Failed(format!(
+            "expected `join_ok` after `join`, got {:?}",
+            std::mem::discriminant(&other)
+        ))),
+    }
+}
+
 /// A small deterministic (not cryptographic) hash used only to give
 /// [`StubJoinTransport`] stable, input-dependent output.
 fn stub_hash(parts: &[&str]) -> u64 {
@@ -166,5 +281,48 @@ mod tests {
         assert!(!identity.client_id.contains(token));
         assert!(!identity.credential.contains(token));
         assert!(!format!("{identity:?}").contains(token));
+    }
+
+    #[test]
+    fn splits_token_id_and_secret_on_first_colon() {
+        let (token_id, secret) =
+            split_token_id_and_secret("tok_7f3a:hlr_join_sometoken").unwrap();
+        assert_eq!(token_id, "tok_7f3a");
+        assert_eq!(secret, "hlr_join_sometoken");
+    }
+
+    #[test]
+    fn split_rejects_a_token_with_no_colon() {
+        let err = split_token_id_and_secret("hlr_join_sometoken").unwrap_err();
+        assert!(matches!(err, JoinError::Failed(_)));
+    }
+
+    #[test]
+    fn ws_join_transport_surfaces_a_clear_error_for_a_malformed_token() {
+        // No network I/O should even be attempted for a token this crate
+        // can already tell is malformed.
+        let err = WsJoinTransport
+            .redeem(&server(), "not-a-valid-token", "kiwi")
+            .unwrap_err();
+        let JoinError::Failed(message) = err;
+        assert!(message.contains("token_id"), "message: {message}");
+    }
+
+    #[test]
+    fn ws_join_transport_connection_refused_is_a_clear_error_not_a_panic() {
+        // Nothing is listening on this loopback port (bound then
+        // immediately dropped, so it's very unlikely to be reused for
+        // something else within this test's lifetime): connect_async
+        // should fail promptly and cleanly rather than hang or panic.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let server = ServerAddress::parse(&format!("ws://127.0.0.1:{port}")).unwrap();
+
+        let err = WsJoinTransport
+            .redeem(&server, "tok_x:hlr_join_y", "kiwi")
+            .unwrap_err();
+        let JoinError::Failed(message) = err;
+        assert!(!message.is_empty());
     }
 }

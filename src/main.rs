@@ -1,9 +1,9 @@
-//! `holler` CLI: `join` / `detach` / `status` / `run` (issues #23, #24).
+//! `holler` CLI: `join` / `detach` / `status` / `run` (issues #23, #24, #16).
 //!
-//! `run` is this crate's first process that actually opens a Holler
-//! WebSocket (see [`holler_client::connection`]); `join`'s redeem step
-//! is still a stub (see [`holler_client::join`]) — that gap is real and
-//! is not this story's to close, see that module's doc comment.
+//! Both `join` (a one-shot `join`/`join_ok` exchange) and `run` (the
+//! long-lived session) open a real Holler WebSocket — see
+//! [`holler_client::join::WsJoinTransport`] and
+//! [`holler_client::connection`] respectively.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
 use holler_client::config::SessionRegistry;
 use holler_client::connection::{self, ConnectionStateStore, LiveState};
 use holler_client::credential::{CredentialStore, PersistedCredential};
-use holler_client::join::{JoinTransport, StubJoinTransport};
+use holler_client::join::{JoinTransport, WsJoinTransport};
 use holler_client::proto::{self, QueryBody};
 use holler_client::query;
 use holler_client::server_address::ServerAddress;
@@ -39,7 +39,9 @@ enum Command {
         /// Server URL, e.g. ws://host:41807 or ws://[::1] (port defaults to 41807).
         #[arg(long)]
         server: String,
-        /// One-time join token. Never persisted or sent again after this call.
+        /// One-time join token, as `<token_id>:<secret>` (both printed by
+        /// `holler token mint` on the server). Never persisted or sent
+        /// again after this call.
         #[arg(long)]
         token: String,
     },
@@ -100,7 +102,7 @@ fn run_join(server: &str, token: &str) -> Result<(), String> {
     let address = ServerAddress::parse(server).map_err(|e| e.to_string())?;
     let hostname = current_hostname();
 
-    let identity = StubJoinTransport
+    let identity = WsJoinTransport
         .redeem(&address, token, &hostname)
         .map_err(|e| e.to_string())?;
 
