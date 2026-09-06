@@ -101,6 +101,35 @@ impl std::error::Error for ConfigError {
     }
 }
 
+/// Sanitizes a raw OS hostname into something safe to use as a session-name
+/// prefix and, downstream, a filesystem path component (holler-server's
+/// talk-log persistence keys files by session name — issue #33). Real
+/// hostnames routinely contain characters outside `[A-Za-z0-9_-]` (a `.`
+/// domain suffix, an apostrophe in "Andre's-MacBook-Pro", etc.); replace
+/// any run of disallowed characters with a single `-`, trim leading/
+/// trailing `-`, and fall back to `"host"` if that leaves nothing usable
+/// (an empty or all-symbol hostname) so the result is never an empty
+/// prefix.
+fn sanitize_hostname_prefix(hostname: &str) -> String {
+    let mut out = String::with_capacity(hostname.len());
+    let mut last_was_dash = false;
+    for c in hostname.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            out.push('-');
+            last_was_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "host".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// In-memory registry of a process's local sessions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRegistry {
@@ -120,15 +149,25 @@ impl SessionRegistry {
         Ok(SessionRegistry { sessions })
     }
 
-    /// The built-in default registry: two sessions, `alpha` and `beta`,
-    /// both using the v1 default harness and command. Used when no config
-    /// file is supplied, so "at least two named local sessions" holds with
-    /// zero configuration.
-    pub fn defaults() -> Self {
+    /// The built-in default registry: two sessions, `<hostname>-alpha` and
+    /// `<hostname>-beta`, both using the v1 default harness and command.
+    /// Used when no config file is supplied, so "at least two named local
+    /// sessions" holds with zero configuration.
+    ///
+    /// Prefixed with `hostname` (sanitized via [`sanitize_hostname_prefix`])
+    /// rather than the bare `alpha`/`beta` this used before: the server's
+    /// roster (holler-server issue #32/#33) enforces session names as
+    /// **globally unique** across every joined machine, and a bare
+    /// `alpha`/`beta` default meant any two unconfigured machines collided
+    /// on their very first join — the second one's default sessions were
+    /// silently rejected. A hostname prefix makes the zero-config case
+    /// collision-free without requiring an operator to hand-pick names.
+    pub fn defaults(hostname: &str) -> Self {
+        let prefix = sanitize_hostname_prefix(hostname);
         SessionRegistry {
             sessions: vec![
-                SessionConfig::default_named("alpha"),
-                SessionConfig::default_named("beta"),
+                SessionConfig::default_named(&format!("{prefix}-alpha")),
+                SessionConfig::default_named(&format!("{prefix}-beta")),
             ],
         }
     }
@@ -233,15 +272,17 @@ pub fn load_from_str(toml_str: &str) -> Result<SessionRegistry, ConfigError> {
 ///
 /// `None` means no config file was supplied by the caller (there is no
 /// implicit conventional-location search); this yields
-/// [`SessionRegistry::defaults`]. `Some(path)` reads and parses that file,
-/// failing closed on I/O errors, parse errors, or duplicate session names.
-pub fn load(path: Option<&Path>) -> Result<SessionRegistry, ConfigError> {
+/// [`SessionRegistry::defaults`] (prefixed with `hostname`). `Some(path)`
+/// reads and parses that file, failing closed on I/O errors, parse errors,
+/// or duplicate session names — `hostname` is unused in that branch, since
+/// an explicit config file's names are taken as given, not prefixed.
+pub fn load(path: Option<&Path>, hostname: &str) -> Result<SessionRegistry, ConfigError> {
     match path {
         Some(path) => {
             let contents = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
             load_from_str(&contents)
         }
-        None => Ok(SessionRegistry::defaults()),
+        None => Ok(SessionRegistry::defaults(hostname)),
     }
 }
 
@@ -289,15 +330,36 @@ mod tests {
 
     #[test]
     fn no_config_supplied_falls_back_to_defaults() {
-        let registry = load(None).expect("default load never fails");
+        let registry = load(None, "kiwi").expect("default load never fails");
 
-        assert_eq!(registry.session_names(), vec!["alpha", "beta"]);
-        for name in ["alpha", "beta"] {
+        assert_eq!(registry.session_names(), vec!["kiwi-alpha", "kiwi-beta"]);
+        for name in ["kiwi-alpha", "kiwi-beta"] {
             let session = registry.get(name).unwrap();
             assert_eq!(session.harness, "opencode");
             assert_eq!(session.command, vec!["opencode", "acp"]);
             assert_eq!(session.interrupt, None);
         }
+    }
+
+    #[test]
+    fn default_session_names_are_sanitized_and_prefixed_by_hostname() {
+        assert_eq!(sanitize_hostname_prefix("kiwi"), "kiwi");
+        assert_eq!(sanitize_hostname_prefix("Andre's-MacBook-Pro.local"), "Andre-s-MacBook-Pro-local");
+        assert_eq!(sanitize_hostname_prefix("  "), "host");
+        assert_eq!(sanitize_hostname_prefix(""), "host");
+
+        let registry = SessionRegistry::defaults("box-a");
+        let other = SessionRegistry::defaults("box-b");
+        assert_eq!(registry.session_names(), vec!["box-a-alpha", "box-a-beta"]);
+        // The whole point: two different, unconfigured machines must not
+        // produce colliding default session names (holler-server's roster
+        // enforces global uniqueness — issue #32/#33).
+        assert!(
+            registry
+                .session_names()
+                .iter()
+                .all(|n| !other.session_names().contains(n))
+        );
     }
 
     #[test]

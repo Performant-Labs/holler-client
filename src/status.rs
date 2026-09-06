@@ -129,7 +129,7 @@ mod tests {
     fn not_joined_omits_client_id() {
         let status = build(
             None,
-            &SessionRegistry::defaults(),
+            &SessionRegistry::defaults("testhost"),
             "kiwi".to_string(),
             LiveState::Disconnected,
             &confirmed_opencode(),
@@ -148,7 +148,7 @@ mod tests {
     fn joined_includes_client_id() {
         let status = build(
             Some("cli_abc123"),
-            &SessionRegistry::defaults(),
+            &SessionRegistry::defaults("testhost"),
             "kiwi".to_string(),
             LiveState::Disconnected,
             &confirmed_opencode(),
@@ -161,7 +161,7 @@ mod tests {
     fn default_registry_sessions_and_harnesses_are_populated_when_confirmed() {
         let status = build(
             None,
-            &SessionRegistry::defaults(),
+            &SessionRegistry::defaults("testhost"),
             "kiwi".to_string(),
             LiveState::Disconnected,
             &confirmed_opencode(),
@@ -177,7 +177,7 @@ mod tests {
     fn unconfirmed_harnesses_hide_their_sessions() {
         let status = build(
             None,
-            &SessionRegistry::defaults(),
+            &SessionRegistry::defaults("testhost"),
             "kiwi".to_string(),
             LiveState::Disconnected,
             &[], // nothing confirmed runnable
@@ -191,7 +191,7 @@ mod tests {
     fn live_connected_reports_connected_not_reconnecting() {
         let status = build(
             None,
-            &SessionRegistry::defaults(),
+            &SessionRegistry::defaults("testhost"),
             "kiwi".to_string(),
             LiveState::Connected,
             &confirmed_opencode(),
@@ -205,7 +205,7 @@ mod tests {
     fn live_connecting_reports_reconnecting_not_connected() {
         let status = build(
             None,
-            &SessionRegistry::defaults(),
+            &SessionRegistry::defaults("testhost"),
             "kiwi".to_string(),
             LiveState::Connecting,
             &confirmed_opencode(),
@@ -219,7 +219,7 @@ mod tests {
     fn live_reconnecting_reports_reconnecting_not_connected() {
         let status = build(
             None,
-            &SessionRegistry::defaults(),
+            &SessionRegistry::defaults("testhost"),
             "kiwi".to_string(),
             LiveState::Reconnecting,
             &confirmed_opencode(),
