@@ -43,8 +43,8 @@
 //! by hand to accommodate the old shape.
 
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, InitializeRequest, SessionNotification, SessionUpdate,
-    StopReason,
+    CancelNotification, ContentBlock, InitializeRequest, SessionId, SessionNotification,
+    SessionUpdate, StopReason,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::util::MatchDispatch;
@@ -166,6 +166,12 @@ pub struct AcpDriver {
     command_tx: mpsc::UnboundedSender<Command>,
     event_rx: mpsc::UnboundedReceiver<DriverEvent>,
     connection: tokio::task::JoinHandle<Result<(), agent_client_protocol::Error>>,
+    /// The ACP session id negotiated with the agent during `session/new`.
+    /// ACP v1's `session/new` request carries no client-chosen name (the
+    /// agent assigns the id), so this is the only reliable source for it —
+    /// callers must not assume it matches the [`SessionConfig`] name that
+    /// was used to spawn this driver.
+    session_id: String,
 }
 
 impl AcpDriver {
@@ -181,7 +187,7 @@ impl AcpDriver {
 
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+        let (ready_tx, ready_rx) = oneshot::channel::<SessionId>();
 
         let connection = tokio::spawn(async move {
             Client
@@ -197,8 +203,9 @@ impl AcpDriver {
                             // Signal readiness only once the session
                             // actually exists, so a caller's first
                             // `prompt()` is never raced against session
-                            // setup.
-                            let _ = ready_tx.send(());
+                            // setup. Carries the agent-assigned session id
+                            // back to `spawn` along with readiness.
+                            let _ = ready_tx.send(session.session_id().clone());
                             run_command_loop(&mut session, command_rx, event_tx).await
                         })
                         .await
@@ -211,10 +218,11 @@ impl AcpDriver {
         // join the task to recover the actual error instead of reporting a
         // generic "disconnected".
         match ready_rx.await {
-            Ok(()) => Ok(Self {
+            Ok(session_id) => Ok(Self {
                 command_tx,
                 event_rx,
                 connection,
+                session_id: session_id.to_string(),
             }),
             Err(_) => Err(match connection.await {
                 Ok(Err(err)) => DriverError::Acp(err.to_string()),
@@ -222,6 +230,15 @@ impl AcpDriver {
                 Err(join_err) => DriverError::Acp(format!("driver task panicked: {join_err}")),
             }),
         }
+    }
+
+    /// The ACP session id the agent assigned during `session/new`. This is
+    /// the identifier a peer control channel (e.g. issue #27's HTTP
+    /// interrupt fallback) must use to address this session — it is not
+    /// guaranteed to match the [`SessionConfig`] name this driver was
+    /// spawned with.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// Sends `session/prompt` with the given text. Returns once the

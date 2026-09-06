@@ -6,3 +6,4 @@
 pub mod acp_driver;
 pub mod config;
 pub mod debug;
+pub mod session_manager;
