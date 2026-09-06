@@ -129,7 +129,7 @@ fn run_run() -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "not joined; run `holler join` first".to_string())?;
 
-    let registry = SessionRegistry::defaults();
+    let registry = SessionRegistry::defaults(&current_hostname());
     let state = ConnectionStateStore::open().map_err(|e| e.to_string())?;
     // A prior `run` in this state dir may have died without clearing a
     // detach marker or its own live-state file; start from a clean slate.
@@ -196,8 +196,8 @@ fn run_detach() -> Result<(), String> {
 fn run_query_local(cmd: &str, args: &[String]) -> Result<(), String> {
     let store = CredentialStore::open().map_err(|e| e.to_string())?;
     let credential = store.load().map_err(|e| e.to_string())?;
-    let registry = SessionRegistry::defaults();
     let hostname = current_hostname();
+    let registry = SessionRegistry::defaults(&hostname);
     let live = ConnectionStateStore::open()
         .map(|s| s.current_state(connection::STALE_AFTER))
         .unwrap_or(LiveState::Disconnected);
