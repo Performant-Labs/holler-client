@@ -11,4 +11,5 @@ Circuit-wide decisions (talk plane, tokens, WebSocket, presence, **protocol v1**
 | 0001 | #2 | Speak Holler protocol v1; answer query locally |
 | 0002 | #3 | Bodies are config + ACP subprocess, not plugins |
 | 0003 | #4 | Versioning: SemVer per crate, starting at 0.1.0, independent of holler-server |
-| 0004–0020 | #5–#21 | reserved |
+| 0004 | #5 | License: AGPL-3.0-or-later, outside PRs now welcome |
+| 0005–0020 | #6–#21 | reserved |
