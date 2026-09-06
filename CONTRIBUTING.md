@@ -2,9 +2,17 @@
 
 ## Code contributions
 
-License is `Proprietary` (see `Cargo.toml`) — as the [README](README.md#status-and-license)
-says, this isn't an open-contribution project at this stage, so we're not taking outside code
-contributions yet. **Issue reports are welcome** — see below.
+License is `AGPL-3.0-or-later` (see [`LICENSE`](LICENSE) and the
+[README](README.md#status-and-license)) — outside pull requests are welcome. The flow is
+lightweight:
+
+1. Fork the repo and create a branch.
+2. Open a pull request against `main`.
+3. CI must pass — `main` is branch-protected and requires both `test (ubuntu-latest)` and
+   `test (macos-latest)` to be green before merge.
+4. A maintainer reviews and merges.
+
+No CLA, no RFC process. **Issue reports are welcome too** — see below.
 
 ## AI-assisted contributions
 

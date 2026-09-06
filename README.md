@@ -61,7 +61,7 @@ See [issue #1](https://github.com/Performant-Labs/holler-client/issues/1) (orien
 
 The [v1 epic](https://github.com/Performant-Labs/holler-client/issues/22) is complete: all 10 builder-order stories are closed, and the shared acceptance gate — join, roster, independent prompts to two live sessions, cooperative interrupt with sibling-session isolation, and clean detach — has passed end-to-end against real OpenCode sessions.
 
-License is `Proprietary` (see `Cargo.toml`) — this isn't an open-contribution project at this stage.
+License is `AGPL-3.0-or-later` (see [`LICENSE`](LICENSE) and [ADR-0004](https://github.com/Performant-Labs/holler-client/issues/5)) — outside PRs are welcome, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Companion repo
 

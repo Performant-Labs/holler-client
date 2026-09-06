@@ -3,7 +3,7 @@ name = "holler-client"
 version = "0.1.0"
 edition = "2021"
 description = "Thin client for the Holler talk circuit"
-license = "Proprietary"
+license = "AGPL-3.0-or-later"
 
 [lib]
 name = "holler_client"
