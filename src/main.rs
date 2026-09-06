@@ -14,6 +14,7 @@ use clap::{Parser, Subcommand};
 use holler_client::config::{self, SessionRegistry};
 use holler_client::connection::{self, ConnectionStateStore, LiveState};
 use holler_client::credential::{CredentialStore, PersistedCredential};
+use holler_client::debug::DebugLevel;
 use holler_client::instance_lock::InstanceLock;
 use holler_client::join::{JoinTransport, WsJoinTransport};
 use holler_client::proto::{self, QueryBody};
@@ -48,6 +49,13 @@ struct Cli {
     /// is no default.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+
+    /// Debug verbosity: `none` (default), `quiet` (high-level frame
+    /// summaries), or `noisy` (full frame JSON, secrets redacted).
+    /// Overrides `HOLLER_DEBUG` when both are set. See
+    /// [`holler_client::debug`] for the exact contract.
+    #[arg(long, global = true)]
+    debug: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -95,9 +103,19 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let config = cli.config.clone();
+    let debug_level = match DebugLevel::resolve(
+        cli.debug.as_deref(),
+        std::env::var("HOLLER_DEBUG").ok().as_deref(),
+    ) {
+        Ok(level) => level,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let result = match cli.command {
-        Command::Join { server, token } => run_join(&server, &token),
-        Command::Run => run_run(config.as_deref()),
+        Command::Join { server, token } => run_join(&server, &token, debug_level),
+        Command::Run => run_run(config.as_deref(), debug_level),
         Command::Detach => run_detach(),
         Command::Status => run_query_local("status", &[], config.as_deref()),
         Command::Support { feature } => {
@@ -119,12 +137,12 @@ fn current_hostname() -> String {
     gethostname::gethostname().to_string_lossy().into_owned()
 }
 
-fn run_join(server: &str, token: &str) -> Result<(), String> {
+fn run_join(server: &str, token: &str, debug_level: DebugLevel) -> Result<(), String> {
     let address = ServerAddress::parse(server).map_err(|e| e.to_string())?;
     let hostname = current_hostname();
 
     let identity = WsJoinTransport
-        .redeem(&address, token, &hostname)
+        .redeem(&address, token, &hostname, debug_level)
         .map_err(|e| e.to_string())?;
 
     let store = CredentialStore::open().map_err(|e| e.to_string())?;
@@ -144,7 +162,7 @@ fn run_join(server: &str, token: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run_run(config: Option<&std::path::Path>) -> Result<(), String> {
+fn run_run(config: Option<&std::path::Path>, debug_level: DebugLevel) -> Result<(), String> {
     // Issue #52: refuse to start a second `run` against the same state
     // dir rather than racing it. Held for this process's whole lifetime
     // (including a crash — the OS releases it when our file descriptors
@@ -183,6 +201,7 @@ fn run_run(config: Option<&std::path::Path>) -> Result<(), String> {
                 &state,
                 session_manager.as_ref(),
                 &mut event_channels,
+                debug_level,
             ) => res,
             _ = tokio::signal::ctrl_c() => {
                 // Cancelling the `run` future here drops the socket

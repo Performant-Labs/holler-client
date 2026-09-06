@@ -75,6 +75,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use crate::acp_driver::{DriverEvent, DriverStatus};
 use crate::config::{SessionConfig, SessionRegistry};
 use crate::credential::{resolve_state_dir, CredentialError, STATE_DIR_ENV};
+use crate::debug::{self, DebugLevel};
 use crate::proto::{
     self, Body, ErrorBody, InterruptBody, PromptBody, CODE_SESSION_UNAVAILABLE,
     CODE_UNAUTHENTICATED, CODE_UNKNOWN_SESSION,
@@ -353,6 +354,7 @@ async fn build_presence_sessions(
 /// server remembers anything from before a drop) once the server's hello
 /// has arrived. Never sends or logs the credential in the clear beyond
 /// this one `auth` frame.
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_auth(
     server_url: &str,
     credential: &str,
@@ -361,6 +363,7 @@ async fn connect_and_auth(
     hostname: &str,
     registry: &SessionRegistry,
     session_manager: Option<&SessionManager>,
+    debug_level: DebugLevel,
 ) -> Result<WsStream, ConnectError> {
     let (mut ws, _response) = tokio_tungstenite::connect_async(server_url)
         .await
@@ -368,6 +371,11 @@ async fn connect_and_auth(
 
     let auth = proto::auth_envelope(token_id, credential);
     let raw = proto::encode(&auth).expect("v1 auth envelope always serializes");
+    debug::log(
+        debug_level,
+        || format!("-> auth token_id={token_id}"),
+        || format!("-> {}", debug::redact_secret(&raw, credential)),
+    );
     ws.send(Message::Text(raw.into()))
         .await
         .map_err(|e| ConnectError::Transport(format!("failed to send auth: {e}")))?;
@@ -392,6 +400,11 @@ async fn connect_and_auth(
     };
     let envelope = proto::decode(&reply_raw)
         .map_err(|e| ConnectError::Transport(format!("malformed frame awaiting hello: {e}")))?;
+    debug::log(
+        debug_level,
+        || format!("<- {} id={}", envelope.msg_type.as_wire_str(), envelope.id),
+        || format!("<- {reply_raw}"),
+    );
     match envelope.body {
         Body::Hello(_) => {}
         Body::Error(ErrorBody { code, message, .. }) if code == CODE_UNAUTHENTICATED => {
@@ -436,6 +449,11 @@ async fn connect_and_auth(
         sessions,
     );
     let raw = proto::encode(&hello).expect("v1 hello envelope always serializes");
+    debug::log(
+        debug_level,
+        || format!("-> hello client_id={client_id} hostname={hostname}"),
+        || format!("-> {raw}"),
+    );
     ws.send(Message::Text(raw.into()))
         .await
         .map_err(|e| ConnectError::Transport(format!("failed to send client hello: {e}")))?;
@@ -443,6 +461,11 @@ async fn connect_and_auth(
     let presence_rows = build_presence_sessions(registry, &confirmed, session_manager).await;
     let presence = proto::client_presence(client_id, presence_rows);
     let raw = proto::encode(&presence).expect("v1 presence envelope always serializes");
+    debug::log(
+        debug_level,
+        || format!("-> presence client_id={client_id}"),
+        || format!("-> {raw}"),
+    );
     ws.send(Message::Text(raw.into()))
         .await
         .map_err(|e| ConnectError::Transport(format!("failed to send client presence: {e}")))?;
@@ -494,6 +517,7 @@ async fn recv_any_event(channels: &mut EventChannels) -> Option<(String, DriverE
 /// dispatches inbound `prompt`/`interrupt` to `session_manager` while
 /// streaming its `reply`/`ack` frames back out. Returns when the
 /// connection ends for any reason.
+#[allow(clippy::too_many_arguments)]
 async fn session_loop(
     mut ws: WsStream,
     client_id: &str,
@@ -502,6 +526,7 @@ async fn session_loop(
     state: &ConnectionStateStore,
     session_manager: Option<&SessionManager>,
     event_channels: &mut EventChannels,
+    debug_level: DebugLevel,
 ) -> LoopExit {
     state.mark_connected();
 
@@ -534,10 +559,20 @@ async fn session_loop(
                             // stricter once it exists.
                             continue;
                         };
+                        debug::log(
+                            debug_level,
+                            || format!("<- {} id={}", envelope.msg_type.as_wire_str(), envelope.id),
+                            || format!("<- {text}"),
+                        );
                         match envelope.body {
                             Body::Ping(_) => {
                                 let pong = proto::pong_reply(&envelope.id, client_id, hostname);
                                 let Ok(raw) = proto::encode(&pong) else { continue };
+                                debug::log(
+                                    debug_level,
+                                    || format!("-> pong id={}", envelope.id),
+                                    || format!("-> {raw}"),
+                                );
                                 if ws.send(Message::Text(raw.into())).await.is_err() {
                                     return LoopExit::Dropped("failed to send pong".to_string());
                                 }
@@ -573,6 +608,11 @@ async fn session_loop(
                                     ),
                                 };
                                 let Ok(raw) = proto::encode(&reply) else { continue };
+                                debug::log(
+                                    debug_level,
+                                    || format!("-> query_reply cmd={} id={}", q.cmd, envelope.id),
+                                    || format!("-> {raw}"),
+                                );
                                 if ws.send(Message::Text(raw.into())).await.is_err() {
                                     return LoopExit::Dropped("failed to send query reply".to_string());
                                 }
@@ -609,6 +649,11 @@ async fn session_loop(
                                 };
                                 if let Some(reply) = reply {
                                     let Ok(raw) = proto::encode(&reply) else { continue };
+                                    debug::log(
+                                        debug_level,
+                                        || format!("-> error (unroutable prompt) id={}", envelope.id),
+                                        || format!("-> {raw}"),
+                                    );
                                     if ws.send(Message::Text(raw.into())).await.is_err() {
                                         return LoopExit::Dropped("failed to send prompt error reply".to_string());
                                     }
@@ -642,6 +687,11 @@ async fn session_loop(
                                     ),
                                 };
                                 let Ok(raw) = proto::encode(&reply) else { continue };
+                                debug::log(
+                                    debug_level,
+                                    || format!("-> interrupt_reply session={session} id={}", envelope.id),
+                                    || format!("-> {raw}"),
+                                );
                                 if ws.send(Message::Text(raw.into())).await.is_err() {
                                     return LoopExit::Dropped("failed to send interrupt reply".to_string());
                                 }
@@ -681,6 +731,11 @@ async fn session_loop(
                 }
                 let ping = proto::heartbeat_ping(client_id, hostname);
                 let Ok(raw) = proto::encode(&ping) else { continue };
+                debug::log(
+                    debug_level,
+                    || "-> ping (heartbeat)".to_string(),
+                    || format!("-> {raw}"),
+                );
                 if ws.send(Message::Text(raw.into())).await.is_err() {
                     return LoopExit::Dropped("failed to send heartbeat ping".to_string());
                 }
@@ -731,6 +786,11 @@ async fn session_loop(
                 };
                 if let Some(reply) = reply {
                     let Ok(raw) = proto::encode(&reply) else { continue };
+                    debug::log(
+                        debug_level,
+                        || format!("-> reply session={name} id={reply_id}"),
+                        || format!("-> {raw}"),
+                    );
                     if ws.send(Message::Text(raw.into())).await.is_err() {
                         return LoopExit::Dropped("failed to send reply".to_string());
                     }
@@ -799,7 +859,11 @@ pub async fn run(
     state: &ConnectionStateStore,
     session_manager: Option<&SessionManager>,
     event_channels: &mut EventChannels,
+    debug_level: DebugLevel,
 ) -> Result<(), ConnectError> {
+    if debug_level != DebugLevel::None {
+        eprintln!("holler: debug={debug_level} — writing frames to stderr, secrets redacted");
+    }
     let mut attempt: u32 = 0;
 
     loop {
@@ -818,6 +882,7 @@ pub async fn run(
             hostname,
             registry,
             session_manager,
+            debug_level,
         )
         .await
         {
@@ -831,6 +896,7 @@ pub async fn run(
                     state,
                     session_manager,
                     event_channels,
+                    debug_level,
                 )
                 .await
                 {
