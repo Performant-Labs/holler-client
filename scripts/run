@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+#
+# Dispatches an org-convention command name (object:sub-object:verb, see
+# Performant-Labs/playbook frameworks/node/npm-scripts.md) to its script.
+# The npm-native equivalent of this file is `npm run <name>`; this crate
+# has no package.json, so this is that entry point instead.
+#
+# Usage: ./scripts/run app:local:run
+
+set -euo pipefail
+
+dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cmd="${1:-}"
+
+case "$cmd" in
+  app:local:tunnel)  exec "$dir/local-tunnel.sh" ;;
+  app:local:run)     exec "$dir/local-run.sh" ;;
+  app:local:stop)    exec "$dir/local-stop.sh" ;;
+  "")
+    echo "usage: ./scripts/run <command>" >&2
+    ;&
+  *)
+    echo "known commands: app:local:tunnel  app:local:run  app:local:stop" >&2
+    exit 1
+    ;;
+esac
