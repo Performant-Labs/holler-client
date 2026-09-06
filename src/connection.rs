@@ -978,16 +978,6 @@ pub async fn run(
     event_channels: &mut EventChannels,
     cfg: DebugConfig,
 ) -> Result<(), ConnectError> {
-    // Announced only when debug logging is actually on — an
-    // Info line saying "debug logging started" would be noise on every
-    // plain `holler run`. When it does fire it goes through the logger, so
-    // it is valid JSON in `json` mode rather than a stray prose line.
-    if cfg.is_on() {
-        debug::info(cfg, "logging_started")
-            .field("format", cfg.format.to_string())
-            .field("note", "frames to stderr, secrets redacted")
-            .emit();
-    }
     let mut attempt: u32 = 0;
 
     loop {

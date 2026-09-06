@@ -93,6 +93,30 @@ command = ["opencode", "acp"]
         self
     }
 
+    /// Like [`Env::with_fake_executable`], but the process stays alive
+    /// (never reads stdin, never writes stdout, never exits) instead of
+    /// exiting immediately — so `SessionManager::spawn`'s ACP
+    /// `initialize` handshake is talking to something that is still
+    /// running and simply never answers, not something that already
+    /// closed. In practice the ACP driver still surfaces a `spawn_failed`
+    /// error quickly rather than waiting out the full
+    /// `SESSION_MANAGER_SPAWN_BUDGET` — the point of this helper isn't a
+    /// specific delay, it's that the subprocess genuinely cannot have
+    /// completed a valid handshake, so a test using it proves an
+    /// ordering, not a race against how fast a script happens to exit.
+    fn with_hanging_executable(self, name: &str) -> Self {
+        let exe = self.path_dir.path().join(name);
+        std::fs::write(&exe, "#!/bin/sh\nsleep 30\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&exe).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&exe, perms).unwrap();
+        }
+        self
+    }
+
     /// Rewrites this env's config so both configured sessions
     /// (`test-alpha`/`test-beta`) use the real `stub-acp` binary
     /// (issue #32) instead of the fake `opencode` script — needed for
@@ -408,6 +432,69 @@ fn unauthenticated_error_envelope() -> proto::Envelope {
 }
 
 const STATUS_BUDGET: Duration = Duration::from_secs(5);
+
+// --- Startup ordering: the debug banner must precede any I/O that could
+// stall (subprocess spawn, network connect) --------------------------------
+
+#[tokio::test]
+async fn logging_started_banner_prints_before_a_hanging_session_spawn_can_block_it() {
+    // The bug this guards against: the banner used to be emitted inside
+    // connection::run, *after* `spawn_session_manager` had already run
+    // to completion (up to SESSION_MANAGER_SPAWN_BUDGET, ~10s, in the
+    // worst case). A user watching stderr saw nothing — not even
+    // confirmation the binary had started — until that finished.
+    //
+    // `with_hanging_executable` (not `with_fake_executable`, which exits
+    // immediately) points the harness at a subprocess that is still
+    // alive and has not spoken ACP, so this proves the banner precedes
+    // session-manager spawn's outcome (whatever shape that outcome
+    // takes — a real hang, or the driver failing fast against a
+    // non-conformant process) rather than merely preceding whatever
+    // happened to run quickly.
+    let env = Env::new().with_hanging_executable("opencode");
+    // A credential must exist or `run_run` fails at "not joined" before
+    // ever reaching `spawn_session_manager` — which would make this test
+    // pass for the wrong reason (any first line beats an error that
+    // never mentions the banner). The address is never dialed: the
+    // session-manager spawn happens *before* the network connect in
+    // `run_run`, and the process is killed well before it gets there.
+    env.write_credential(
+        "ws://127.0.0.1:1",
+        "hlr_live_unused",
+        "tok_unused",
+        "cli_unused",
+        "unused-host",
+    );
+    let mut cmd = env.cmd();
+    cmd.arg("--debug").arg("quiet").arg("run");
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to spawn `holler run`");
+
+    let mut stderr = std::io::BufReader::new(child.stderr.take().expect("stderr was piped"));
+    let read = tokio::task::spawn_blocking(move || {
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut stderr, &mut line).ok();
+        line
+    });
+
+    let line = tokio::time::timeout(Duration::from_secs(3), read)
+        .await
+        .expect(
+            "the banner should print almost instantly; 3s is still well \
+             under the ~10s session-manager spawn budget, so a timeout \
+             here means the banner is still stuck behind the spawn",
+        )
+        .expect("reading stderr panicked");
+
+    assert!(
+        line.contains("logging_started"),
+        "expected the startup banner as the first stderr line, got: {line:?}"
+    );
+
+    kill(child);
+}
 
 #[tokio::test]
 async fn auth_then_hello_round_trip_and_status_reports_connected() {
