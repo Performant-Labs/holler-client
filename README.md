@@ -92,6 +92,38 @@ jq -e . debug.log > /dev/null   # every line parses
 jq -r .ts debug.log | sort -c   # emission timestamps are ordered
 ```
 
+#### Severity is independent of `--debug`
+
+`--debug` controls how much of the *frame trace* you get. It does not gate operational facts. Every line carries a `level`:
+
+| `level` | Gated by | Examples |
+|---|---|---|
+| `debug` | `--debug` (nothing at `none`) | frames in/out, connect/detach lifecycle |
+| `info` | never — only shaped by `--log-format` | `logging_started` |
+| `warn` | never — only shaped by `--log-format` | connection dropped, connect failed, local sessions failed to start |
+
+So a dropped connection is reported **whether or not `--debug` is set** — it was an unconditional message before this existed, and it is the line you would build an alert on:
+
+```
+$ holler run --log-format=json          # note: no --debug at all
+{"ts":"...","level":"warn","verbosity":"none","type":"conn","event":"dropped","reason":"socket read error: ..."}
+```
+
+```
+$ holler run                            # no flags at all, default text
+2026-09-06T21:43:22.975623Z WARN     conn       event=dropped reason=socket read error: ...
+```
+
+#### stderr also carries CLI errors
+
+One caveat for anyone pointing a log shipper at this: a fatal CLI error prints as plain text on stderr immediately before a non-zero exit, because it is user-facing command output rather than a log line:
+
+```
+error: join failed: connect to ws://... failed: IO error: Connection refused (os error 111)
+```
+
+Everything the logger emits is JSON in `json` mode, but stderr as a whole is therefore not guaranteed pure JSONL. Redirect the log to its own file (`2>debug.log`) and ship that, or filter the single `error: ` line, rather than assuming the raw stream parses end to end.
+
 The leading `ts` is an **emission** timestamp — when this process logged the line, from this host's clock — at fixed RFC 3339 microsecond precision, so the column is genuinely fixed-width. That is deliberately not the frame's own `ts`, which is the peer's claim from the peer's clock; the two diverge enough in practice (~180ms measured cross-machine) that sorting a handshake by frame `ts` reorders it against causality. Sort a log by `ts`, not by `.frame.ts`.
 
 ## Architecture

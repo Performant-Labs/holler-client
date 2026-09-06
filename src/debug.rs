@@ -46,13 +46,20 @@ pub enum DebugLevel {
     Noisy,
 }
 
-impl fmt::Display for DebugLevel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+impl DebugLevel {
+    /// The wire/display name of this level.
+    pub fn as_str(self) -> &'static str {
+        match self {
             DebugLevel::None => "none",
             DebugLevel::Quiet => "quiet",
             DebugLevel::Noisy => "noisy",
-        })
+        }
+    }
+}
+
+impl fmt::Display for DebugLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -235,6 +242,55 @@ impl DebugConfig {
     }
 }
 
+/// How important a line is — an axis **independent of** [`DebugLevel`].
+///
+/// [`DebugLevel`] answers "how much of the frame trace do you want?".
+/// Severity answers "does an operator need to see this at all?". They are
+/// not the same question, and conflating them loses exactly the lines that
+/// matter most:
+///
+/// - [`Severity::Debug`] is the frame/lifecycle trace. Gated by
+///   [`DebugLevel`] exactly as before: nothing at
+///   [`DebugLevel::None`].
+/// - [`Severity::Info`] and [`Severity::Warn`] are operational facts — the
+///   connection dropped, local sessions failed to start. These printed
+///   unconditionally as bare `eprintln!` text before, so gating them by
+///   [`DebugLevel`] would be a real regression in operator visibility.
+///   They are gated only by [`LogFormat`]: always emitted, in whichever
+///   shape is configured.
+///
+/// This is why the `level` key in `json` output is a real field rather
+/// than the constant `"debug"` it started as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Severity {
+    /// Frame and lifecycle trace; only when `--debug` asks for it.
+    #[default]
+    Debug,
+    /// A normal operational fact worth recording either way.
+    Info,
+    /// Something went wrong that an operator would alert on.
+    Warn,
+}
+
+impl Severity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Severity::Debug => "debug",
+            Severity::Info => "info",
+            Severity::Warn => "warn",
+        }
+    }
+
+    /// Padded to a fixed width so the column after it still lines up.
+    fn as_text(self) -> &'static str {
+        match self {
+            Severity::Debug => "DEBUG",
+            Severity::Info => "INFO ",
+            Severity::Warn => "WARN ",
+        }
+    }
+}
+
 /// Which way a frame moved, relative to this process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -329,6 +385,7 @@ struct JsonLine<'a> {
 /// nothing beyond the (stack-only) builder itself.
 pub struct Event<'a> {
     cfg: DebugConfig,
+    severity: Severity,
     dir: Direction,
     kind: &'a str,
     id: Option<&'a str>,
@@ -339,23 +396,48 @@ pub struct Event<'a> {
 
 /// A frame this process is sending.
 pub fn outgoing(cfg: DebugConfig, kind: &str) -> Event<'_> {
-    Event::new(cfg, Direction::Out, kind)
+    Event::new(cfg, Severity::Debug, Direction::Out, kind)
 }
 
 /// A frame this process just received.
 pub fn incoming(cfg: DebugConfig, kind: &str) -> Event<'_> {
-    Event::new(cfg, Direction::In, kind)
+    Event::new(cfg, Severity::Debug, Direction::In, kind)
 }
 
 /// A local lifecycle event, not a frame.
 pub fn local(cfg: DebugConfig, kind: &str) -> Event<'_> {
-    Event::new(cfg, Direction::Local, kind)
+    Event::new(cfg, Severity::Debug, Direction::Local, kind)
+}
+
+/// An operational fact worth recording whether or not debug logging is
+/// on — always emitted, in whichever [`LogFormat`] is configured.
+pub fn info(cfg: DebugConfig, kind: &str) -> Event<'_> {
+    Event::new(cfg, Severity::Info, Direction::Local, kind)
+}
+
+/// Something went wrong that an operator would alert on — always emitted,
+/// in whichever [`LogFormat`] is configured. These are the lines that used
+/// to be bare `eprintln!` text and so were invisible to a log analyzer.
+pub fn warn(cfg: DebugConfig, kind: &str) -> Event<'_> {
+    Event::new(cfg, Severity::Warn, Direction::Local, kind)
 }
 
 impl<'a> Event<'a> {
-    fn new(cfg: DebugConfig, dir: Direction, kind: &'a str) -> Self {
+    /// Whether this line will actually be written — the one gate both
+    /// [`Event::field`] and [`Event::emit`] consult, so a `warn` at
+    /// [`DebugLevel::None`] keeps its fields instead of silently dropping
+    /// them.
+    fn will_emit(&self) -> bool {
+        match self.severity {
+            Severity::Debug => self.cfg.is_on(),
+            Severity::Info | Severity::Warn => true,
+        }
+    }
+
+    fn new(cfg: DebugConfig, severity: Severity, dir: Direction, kind: &'a str) -> Self {
         Event {
             cfg,
+            severity,
             dir,
             kind,
             id: None,
@@ -380,7 +462,7 @@ impl<'a> Event<'a> {
 
     /// An extra `k=v` detail (session name, query cmd, ...).
     pub fn field(mut self, key: &'static str, value: impl Into<String>) -> Self {
-        if self.cfg.is_on() {
+        if self.will_emit() {
             self.fields.push((key, value.into()));
         }
         self
@@ -402,7 +484,7 @@ impl<'a> Event<'a> {
     /// Writes the line to stderr, or does nothing at
     /// [`DebugLevel::None`].
     pub fn emit(self) {
-        if !self.cfg.is_on() {
+        if !self.will_emit() {
             return;
         }
         match self.cfg.format {
@@ -413,8 +495,9 @@ impl<'a> Event<'a> {
 
     fn render_text(&self) -> String {
         let mut line = format!(
-            "{} DEBUG {} {:<width$}",
+            "{} {} {} {:<width$}",
             emission_ts(),
+            self.severity.as_text(),
             self.dir.as_text(),
             self.kind,
             width = TYPE_COLUMN_WIDTH,
@@ -445,11 +528,8 @@ impl<'a> Event<'a> {
         });
         let line = JsonLine {
             ts: emission_ts(),
-            level: "debug",
-            verbosity: match self.cfg.level {
-                DebugLevel::Noisy => "noisy",
-                _ => "quiet",
-            },
+            level: self.severity.as_str(),
+            verbosity: self.cfg.level.as_str(),
             dir: self.dir.as_json(),
             kind: self.kind,
             id: self.id,
@@ -761,6 +841,97 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert!(parsed.get("dir").is_none());
         assert_eq!(parsed["addr"], "127.0.0.1:41807");
+    }
+
+    // --- severity is independent of debug level (issue #81 follow-up) ---
+
+    #[test]
+    fn warn_is_emitted_even_at_debug_level_none() {
+        let cfg = DebugConfig::new(DebugLevel::None, LogFormat::Json);
+        let event = warn(cfg, "conn").field("event", "dropped");
+        assert!(
+            event.will_emit(),
+            "a warn must survive DebugLevel::None — these lines used to be \
+             unconditional eprintln! and an operator alerts on them"
+        );
+    }
+
+    #[test]
+    fn info_is_emitted_even_at_debug_level_none() {
+        let cfg = DebugConfig::new(DebugLevel::None, LogFormat::Text);
+        assert!(info(cfg, "logging_started").will_emit());
+    }
+
+    #[test]
+    fn debug_severity_is_still_gated_by_debug_level() {
+        let none = DebugConfig::new(DebugLevel::None, LogFormat::Json);
+        assert!(!outgoing(none, "auth").will_emit());
+        let quiet = DebugConfig::new(DebugLevel::Quiet, LogFormat::Json);
+        assert!(outgoing(quiet, "auth").will_emit());
+    }
+
+    #[test]
+    fn warn_at_level_none_keeps_its_fields() {
+        // Regression guard: `field()` gates on the same predicate `emit()`
+        // does, so a warn below `DebugLevel::None` must not silently drop
+        // the reason an operator needs.
+        let cfg = DebugConfig::new(DebugLevel::None, LogFormat::Json);
+        let line = warn(cfg, "conn")
+            .field("event", "dropped")
+            .field("reason", "connection closed by peer")
+            .render_json();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["level"], "warn");
+        assert_eq!(parsed["event"], "dropped");
+        assert_eq!(parsed["reason"], "connection closed by peer");
+        assert_eq!(parsed["verbosity"], "none");
+    }
+
+    #[test]
+    fn json_level_reflects_severity_not_a_constant() {
+        let cfg = noisy_json();
+        let d: serde_json::Value =
+            serde_json::from_str(&outgoing(cfg, "auth").render_json()).unwrap();
+        let i: serde_json::Value =
+            serde_json::from_str(&info(cfg, "logging_started").render_json()).unwrap();
+        let w: serde_json::Value = serde_json::from_str(&warn(cfg, "conn").render_json()).unwrap();
+        assert_eq!(d["level"], "debug");
+        assert_eq!(i["level"], "info");
+        assert_eq!(w["level"], "warn");
+    }
+
+    #[test]
+    fn text_severity_column_is_fixed_width() {
+        // DEBUG/INFO/WARN all occupy 5 columns, so the direction and type
+        // columns after them still line up.
+        let cfg = noisy_text();
+        for line in [
+            outgoing(cfg, "auth").render_text(),
+            info(cfg, "logging_started").render_text(),
+            warn(cfg, "conn").render_text(),
+        ] {
+            assert_eq!(&line[27..28], " ", "line was {line:?}");
+            assert_eq!(&line[33..34], " ", "severity column width, line {line:?}");
+        }
+    }
+
+
+    #[test]
+    fn flattened_fields_never_shadow_an_envelope_key() {
+        // `fields` is `#[serde(flatten)]`ed into the same object as the
+        // envelope keys, so a field named `verbosity`/`ts`/`level`/`type`
+        // would emit a duplicate JSON key. Callers must not reuse these
+        // names; this pins the envelope key set that is off limits.
+        let line = info(noisy_json(), "logging_started")
+            .field("format", "json")
+            .render_json();
+        for key in ["ts", "level", "verbosity", "type"] {
+            let occurrences = line.matches(&format!("\"{key}\":")).count();
+            assert_eq!(occurrences, 1, "duplicate {key:?} key in {line:?}");
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["verbosity"], "noisy");
+        assert_eq!(parsed["format"], "json");
     }
 
     #[test]

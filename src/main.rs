@@ -14,7 +14,7 @@ use clap::{Parser, Subcommand};
 use holler_client::config::{self, SessionRegistry};
 use holler_client::connection::{self, ConnectionStateStore, LiveState};
 use holler_client::credential::{CredentialStore, PersistedCredential};
-use holler_client::debug::{DebugConfig, DebugLevel, LogFormat};
+use holler_client::debug::{self, DebugConfig, DebugLevel, LogFormat};
 use holler_client::instance_lock::InstanceLock;
 use holler_client::join::{JoinTransport, WsJoinTransport};
 use holler_client::proto::{self, QueryBody};
@@ -202,7 +202,7 @@ fn run_run(config: Option<&std::path::Path>, cfg: DebugConfig) -> Result<(), Str
 
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let result = runtime.block_on(async {
-        let mut session_manager = spawn_session_manager(&registry).await;
+        let mut session_manager = spawn_session_manager(&registry, cfg).await;
         let mut event_channels = session_manager
             .as_mut()
             .map(|m| m.take_event_channels())
@@ -247,7 +247,10 @@ fn run_run(config: Option<&std::path::Path>, cfg: DebugConfig) -> Result<(), Str
 /// without live sessions, answering `prompt`/`interrupt` for any of them
 /// with `unknown_session` — the same as an unconfigured session, not a
 /// reason to refuse the WebSocket connection itself.
-async fn spawn_session_manager(registry: &SessionRegistry) -> Option<SessionManager> {
+async fn spawn_session_manager(
+    registry: &SessionRegistry,
+    cfg: DebugConfig,
+) -> Option<SessionManager> {
     let confirmed = registry.confirmed_harnesses();
     let live_sessions: Vec<_> = registry
         .sessions()
@@ -268,12 +271,24 @@ async fn spawn_session_manager(registry: &SessionRegistry) -> Option<SessionMana
     .await
     {
         Ok(Ok(manager)) => Some(manager),
+        // Both failure paths are always emitted, at every debug level:
+        // connecting without the local sessions an operator configured is
+        // exactly the kind of degradation worth alerting on.
         Ok(Err(err)) => {
-            eprintln!("holler: failed to start local sessions: {err}");
+            debug::warn(cfg, "sessions")
+                .field("event", "spawn_failed")
+                .field("reason", err.to_string())
+                .emit();
             None
         }
         Err(_) => {
-            eprintln!("holler: timed out starting local sessions");
+            debug::warn(cfg, "sessions")
+                .field("event", "spawn_timeout")
+                .field(
+                    "reason",
+                    format!("timed out after {SESSION_MANAGER_SPAWN_BUDGET:?}"),
+                )
+                .emit();
             None
         }
     }

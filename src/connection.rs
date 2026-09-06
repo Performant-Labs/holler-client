@@ -867,11 +867,15 @@ pub async fn run(
     event_channels: &mut EventChannels,
     cfg: DebugConfig,
 ) -> Result<(), ConnectError> {
+    // Announced only when debug logging is actually on — an
+    // Info line saying "debug logging started" would be noise on every
+    // plain `holler run`. When it does fire it goes through the logger, so
+    // it is valid JSON in `json` mode rather than a stray prose line.
     if cfg.is_on() {
-        eprintln!(
-            "holler: debug={} format={} — writing frames to stderr, secrets redacted",
-            cfg.level, cfg.format
-        );
+        debug::info(cfg, "logging_started")
+            .field("format", cfg.format.to_string())
+            .field("note", "frames to stderr, secrets redacted")
+            .emit();
     }
     let mut attempt: u32 = 0;
 
@@ -918,11 +922,13 @@ pub async fn run(
                         return Ok(());
                     }
                     LoopExit::Dropped(reason) => {
-                        debug::local(cfg, "conn")
+                        // Always emitted, at every debug level: this is
+                        // the line an operator alerts on, so it must not
+                        // vanish just because `--debug` is off.
+                        debug::warn(cfg, "conn")
                             .field("event", "dropped")
                             .field("reason", reason.as_str())
                             .emit();
-                        eprintln!("holler: connection dropped: {reason}");
                     }
                 }
             }
@@ -931,7 +937,10 @@ pub async fn run(
                 return Err(ConnectError::Unauthenticated(msg));
             }
             Err(ConnectError::Transport(msg)) => {
-                eprintln!("holler: connect failed: {msg}");
+                debug::warn(cfg, "conn")
+                    .field("event", "connect_failed")
+                    .field("reason", msg.as_str())
+                    .emit();
             }
         }
 

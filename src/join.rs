@@ -179,10 +179,10 @@ async fn redeem_async(
     cfg: DebugConfig,
 ) -> Result<RedeemedIdentity, JoinError> {
     if cfg.is_on() {
-        eprintln!(
-            "holler: debug={} format={} — writing frames to stderr, secrets redacted",
-            cfg.level, cfg.format
-        );
+        debug::info(cfg, "logging_started")
+            .field("format", cfg.format.to_string())
+            .field("note", "frames to stderr, secrets redacted")
+            .emit();
     }
     let url = server.to_canonical_url();
     let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
