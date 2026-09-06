@@ -49,6 +49,11 @@ pub(crate) fn resolve_state_dir(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedCredential {
     pub client_id: String,
+    /// The join token's public `token_id` — what the client must send as
+    /// `from` on `auth` (and every subsequent envelope on that
+    /// connection), per `docs/protocol/v1.md` §4/§6. Distinct from
+    /// `client_id`, which the server never authenticates against.
+    pub token_id: String,
     pub credential: String,
     /// Canonical `scheme://host:port` of the server joined, so a future
     /// reconnect (issue #24) knows where to dial without re-parsing
@@ -175,6 +180,7 @@ mod tests {
     fn sample() -> PersistedCredential {
         PersistedCredential {
             client_id: "cli_abc123".to_string(),
+            token_id: "tok_7f3a".to_string(),
             credential: "hlr_live_secretvalue".to_string(),
             server: "ws://example.com:41807".to_string(),
             hostname: "kiwi".to_string(),
@@ -262,13 +268,19 @@ mod tests {
     }
 
     #[test]
-    fn persisted_credential_never_contains_a_join_token_field() {
+    fn persisted_credential_never_contains_the_one_time_join_secret() {
         // Structural guard: PersistedCredential has no field for the
-        // one-time join token. Serializing `sample()` (whose `credential`
-        // deliberately looks like a secret) and checking the *keys* age
-        // this test well even if field values change later.
+        // one-time join secret (the `<secret>` half of `--token
+        // <token_id>:<secret>`) — only the public `token_id`, which is
+        // safe and necessary to persist (issue #47) for `auth`'s `from`.
+        // Serializing `sample()` (whose `credential` deliberately looks
+        // like a secret, and whose `token_id` deliberately looks like a
+        // real one) and checking for the join-secret's `hlr_join_` prefix
+        // and a `join_token`/`secret` key ages this test well even if
+        // field values change later.
         let json = serde_json::to_string(&sample()).unwrap();
         assert!(!json.contains("join_token"));
-        assert!(!json.contains("token"));
+        assert!(!json.contains("\"secret\""));
+        assert!(!json.contains("hlr_join_"));
     }
 }

@@ -18,17 +18,15 @@
 //! doesn't send a join token itself; it only resumes with an
 //! already-persisted credential, same as before.
 //!
-//! # This client also has no `token_id`, only a `client_id`
+//! # `hello`'s own `token_id` field is still unset
 //!
 //! `docs/protocol/v1.md` §3/§6 says the client envelope `from` is the
-//! **public `token_id`**, and a client `hello` carries both `token_id`
-//! and `client_id` as distinct fields. Issue #23's [`crate::credential::PersistedCredential`]
-//! only persists `client_id` (plus the credential, server, and
-//! hostname) — no `token_id` was ever handed back to this crate to
-//! store. This module uses `client_id` for `from` and leaves `hello`'s
-//! `token_id` unset (an `Option`, so this is wire-legal) rather than
-//! inventing a value. This is a smaller, independent gap from the redeem
-//! one above — worth a future story, not a blocker for reconnect.
+//! **public `token_id`** — [`connect_and_auth`] sends it correctly on
+//! `auth` (issue #47; [`crate::credential::PersistedCredential`] now
+//! persists it). `hello`'s own `body.token_id` field (distinct from
+//! `body.client_id`) is left unset (an `Option`, so this is wire-legal)
+//! since nothing consumes it server-side yet — a smaller, independent
+//! gap, worth a future story rather than a blocker here.
 //!
 //! # Heartbeat and backoff numbers
 //!
@@ -283,6 +281,7 @@ impl std::error::Error for ConnectError {}
 async fn connect_and_auth(
     server_url: &str,
     credential: &str,
+    token_id: &str,
     client_id: &str,
     hostname: &str,
     registry: &SessionRegistry,
@@ -291,7 +290,7 @@ async fn connect_and_auth(
         .await
         .map_err(|e| ConnectError::Transport(format!("connect to {server_url} failed: {e}")))?;
 
-    let auth = proto::auth_envelope(client_id, credential);
+    let auth = proto::auth_envelope(token_id, credential);
     let raw = proto::encode(&auth).expect("v1 auth envelope always serializes");
     ws.send(Message::Text(raw.into()))
         .await
@@ -544,6 +543,7 @@ async fn sleep_or_detach(delay: Duration, state: &ConnectionStateStore) -> bool 
 pub async fn run(
     server_url: &str,
     credential: &str,
+    token_id: &str,
     client_id: &str,
     hostname: &str,
     registry: &SessionRegistry,
@@ -559,7 +559,11 @@ pub async fn run(
         }
 
         state.mark_connecting(attempt > 0);
-        match connect_and_auth(server_url, credential, client_id, hostname, registry).await {
+        match connect_and_auth(
+            server_url, credential, token_id, client_id, hostname, registry,
+        )
+        .await
+        {
             Ok(ws) => {
                 attempt = 0; // a successful handshake resets the backoff schedule
                 match session_loop(ws, client_id, hostname, registry, state).await {

@@ -119,6 +119,7 @@ fn run_join(server: &str, token: &str) -> Result<(), String> {
     let store = CredentialStore::open().map_err(|e| e.to_string())?;
     let persisted = PersistedCredential {
         client_id: identity.client_id,
+        token_id: identity.token_id,
         credential: identity.credential,
         server: address.to_canonical_url(),
         hostname,
@@ -152,6 +153,7 @@ fn run_run(config: Option<&std::path::Path>) -> Result<(), String> {
             res = connection::run(
                 &credential.server,
                 &credential.credential,
+                &credential.token_id,
                 &credential.client_id,
                 &credential.hostname,
                 &registry,

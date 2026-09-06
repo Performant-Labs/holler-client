@@ -106,11 +106,13 @@ command = ["opencode", "acp"]
         &self,
         server_url: &str,
         credential: &str,
+        token_id: &str,
         client_id: &str,
         hostname: &str,
     ) {
         let contents = serde_json::json!({
             "client_id": client_id,
+            "token_id": token_id,
             "credential": credential,
             "server": server_url,
             "hostname": hostname,
@@ -222,8 +224,24 @@ async fn send_envelope(ws: &mut WebSocketStream<TcpStream>, env: &proto::Envelop
     ws.send(Message::Text(raw.into())).await.unwrap();
 }
 
-async fn expect_auth(ws: &mut WebSocketStream<TcpStream>) -> proto::AuthBody {
+/// Reads the client's `auth` frame and validates `from` the way a real
+/// server would (`docs/protocol/v1.md` §3/§4: `from` is the client's
+/// public `token_id`) — issue #47 shipped silently because this used to
+/// accept any `from` value, including `client_id`, without checking it
+/// looked like the `token_id` a real server binds against.
+async fn expect_auth(
+    ws: &mut WebSocketStream<TcpStream>,
+    expected_token_id: &str,
+) -> proto::AuthBody {
+    assert!(
+        expected_token_id.starts_with("tok_"),
+        "test fixture bug: expected_token_id should look like a real token_id, got {expected_token_id:?}"
+    );
     let envelope = next_envelope(ws).await.expect("expected an `auth` frame");
+    assert_eq!(
+        envelope.from, expected_token_id,
+        "`auth`'s `from` must be the client's token_id, not client_id or anything else"
+    );
     match envelope.body {
         Body::Auth(a) => a,
         other => panic!("expected `auth`, got {other:?}"),
@@ -302,12 +320,12 @@ const STATUS_BUDGET: Duration = Duration::from_secs(5);
 async fn auth_then_hello_round_trip_and_status_reports_connected() {
     let env = Env::new();
     let (listener, url) = bind_local().await;
-    env.write_credential(&url, "hlr_live_good", "cli_test1", "test-host");
+    env.write_credential(&url, "hlr_live_good", "tok_test1", "cli_test1", "test-host");
 
     let child = spawn_run(&env);
 
     let mut ws = accept_ws(&listener).await;
-    let auth = expect_auth(&mut ws).await;
+    let auth = expect_auth(&mut ws, "tok_test1").await;
     assert_eq!(auth.credential, "hlr_live_good");
     send_envelope(&mut ws, &server_hello_envelope()).await;
 
@@ -335,12 +353,12 @@ async fn auth_then_hello_round_trip_and_status_reports_connected() {
 async fn ping_from_server_is_answered_with_pong_including_hostname() {
     let env = Env::new();
     let (listener, url) = bind_local().await;
-    env.write_credential(&url, "hlr_live_good", "cli_test2", "pong-host");
+    env.write_credential(&url, "hlr_live_good", "tok_test2", "cli_test2", "pong-host");
 
     let child = spawn_run(&env);
 
     let mut ws = accept_ws(&listener).await;
-    expect_auth(&mut ws).await;
+    expect_auth(&mut ws, "tok_test2").await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
     next_envelope(&mut ws)
         .await
@@ -362,7 +380,13 @@ async fn ping_from_server_is_answered_with_pong_including_hostname() {
 async fn reconnect_with_backoff_triggers_and_eventually_succeeds() {
     let env = Env::new();
     let (listener, url) = bind_local().await;
-    env.write_credential(&url, "hlr_live_good", "cli_test3", "reconnect-host");
+    env.write_credential(
+        &url,
+        "hlr_live_good",
+        "tok_test3",
+        "cli_test3",
+        "reconnect-host",
+    );
 
     let child = spawn_run(&env);
 
@@ -370,7 +394,7 @@ async fn reconnect_with_backoff_triggers_and_eventually_succeeds() {
     // warning (a real dropped-connection simulation).
     {
         let mut ws = accept_ws(&listener).await;
-        expect_auth(&mut ws).await;
+        expect_auth(&mut ws, "tok_test3").await;
         send_envelope(&mut ws, &server_hello_envelope()).await;
         let _ = ws.close(None).await;
     }
@@ -380,7 +404,7 @@ async fn reconnect_with_backoff_triggers_and_eventually_succeeds() {
     // Second connection: the client's backoff loop retries against the
     // same listener; complete the handshake again.
     let mut ws2 = accept_ws(&listener).await;
-    expect_auth(&mut ws2).await;
+    expect_auth(&mut ws2, "tok_test3").await;
     send_envelope(&mut ws2, &server_hello_envelope()).await;
 
     let status = env.wait_for_status(STATUS_BUDGET, |doc| doc["connected"] == true);
@@ -393,12 +417,12 @@ async fn reconnect_with_backoff_triggers_and_eventually_succeeds() {
 async fn wrong_credential_surfaces_as_a_clear_failure_not_a_retry_loop() {
     let env = Env::new();
     let (listener, url) = bind_local().await;
-    env.write_credential(&url, "hlr_live_bad", "cli_test4", "bad-host");
+    env.write_credential(&url, "hlr_live_bad", "tok_test4", "cli_test4", "bad-host");
 
     let mut child = spawn_run_capturing_stderr(&env);
 
     let mut ws = accept_ws(&listener).await;
-    expect_auth(&mut ws).await;
+    expect_auth(&mut ws, "tok_test4").await;
     send_envelope(&mut ws, &unauthenticated_error_envelope()).await;
 
     let status = wait_for_exit(&mut child, Duration::from_secs(5))
@@ -436,12 +460,18 @@ async fn wrong_credential_surfaces_as_a_clear_failure_not_a_retry_loop() {
 async fn detach_closes_a_live_connection_and_the_run_process_exits() {
     let env = Env::new();
     let (listener, url) = bind_local().await;
-    env.write_credential(&url, "hlr_live_good", "cli_test5", "detach-host");
+    env.write_credential(
+        &url,
+        "hlr_live_good",
+        "tok_test5",
+        "cli_test5",
+        "detach-host",
+    );
 
     let mut child = spawn_run(&env);
 
     let mut ws = accept_ws(&listener).await;
-    expect_auth(&mut ws).await;
+    expect_auth(&mut ws, "tok_test5").await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
     next_envelope(&mut ws)
         .await
@@ -467,12 +497,18 @@ async fn detach_closes_a_live_connection_and_the_run_process_exits() {
 async fn query_status_from_server_is_answered_with_the_real_status_document() {
     let env = Env::new().with_fake_executable("opencode");
     let (listener, url) = bind_local().await;
-    env.write_credential(&url, "hlr_live_good", "cli_query1", "query-host");
+    env.write_credential(
+        &url,
+        "hlr_live_good",
+        "tok_query1",
+        "cli_query1",
+        "query-host",
+    );
 
     let child = spawn_run(&env);
 
     let mut ws = accept_ws(&listener).await;
-    expect_auth(&mut ws).await;
+    expect_auth(&mut ws, "tok_query1").await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
     next_envelope(&mut ws)
         .await
@@ -502,12 +538,18 @@ async fn query_status_from_server_is_answered_with_the_real_status_document() {
 async fn query_support_reports_true_for_an_implemented_protocol_feature() {
     let env = Env::new();
     let (listener, url) = bind_local().await;
-    env.write_credential(&url, "hlr_live_good", "cli_query2", "support-host");
+    env.write_credential(
+        &url,
+        "hlr_live_good",
+        "tok_query2",
+        "cli_query2",
+        "support-host",
+    );
 
     let child = spawn_run(&env);
 
     let mut ws = accept_ws(&listener).await;
-    expect_auth(&mut ws).await;
+    expect_auth(&mut ws, "tok_query2").await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
     next_envelope(&mut ws)
         .await
@@ -537,12 +579,18 @@ async fn query_support_reports_true_for_an_implemented_protocol_feature() {
 async fn query_support_reports_true_for_confirmed_runnable_harness() {
     let env = Env::new().with_fake_executable("opencode");
     let (listener, url) = bind_local().await;
-    env.write_credential(&url, "hlr_live_good", "cli_query3", "support-host2");
+    env.write_credential(
+        &url,
+        "hlr_live_good",
+        "tok_query3",
+        "cli_query3",
+        "support-host2",
+    );
 
     let child = spawn_run(&env);
 
     let mut ws = accept_ws(&listener).await;
-    expect_auth(&mut ws).await;
+    expect_auth(&mut ws, "tok_query3").await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
     next_envelope(&mut ws)
         .await
@@ -575,12 +623,18 @@ async fn query_support_reports_false_for_a_harness_not_on_path() {
     // — is not confirmed runnable, even though it *is* configured.
     let env = Env::new();
     let (listener, url) = bind_local().await;
-    env.write_credential(&url, "hlr_live_good", "cli_query4", "support-host3");
+    env.write_credential(
+        &url,
+        "hlr_live_good",
+        "tok_query4",
+        "cli_query4",
+        "support-host3",
+    );
 
     let child = spawn_run(&env);
 
     let mut ws = accept_ws(&listener).await;
-    expect_auth(&mut ws).await;
+    expect_auth(&mut ws, "tok_query4").await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
     next_envelope(&mut ws)
         .await
@@ -610,12 +664,18 @@ async fn query_support_reports_false_for_a_harness_not_on_path() {
 async fn query_caps_reports_a_capability_entry_for_every_known_id() {
     let env = Env::new();
     let (listener, url) = bind_local().await;
-    env.write_credential(&url, "hlr_live_good", "cli_query5", "caps-host");
+    env.write_credential(
+        &url,
+        "hlr_live_good",
+        "tok_query5",
+        "cli_query5",
+        "caps-host",
+    );
 
     let child = spawn_run(&env);
 
     let mut ws = accept_ws(&listener).await;
-    expect_auth(&mut ws).await;
+    expect_auth(&mut ws, "tok_query5").await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
     next_envelope(&mut ws)
         .await
@@ -642,12 +702,18 @@ async fn query_caps_reports_a_capability_entry_for_every_known_id() {
 async fn query_protocol_with_no_args_reports_this_binarys_min_max() {
     let env = Env::new();
     let (listener, url) = bind_local().await;
-    env.write_credential(&url, "hlr_live_good", "cli_query6", "protocol-host");
+    env.write_credential(
+        &url,
+        "hlr_live_good",
+        "tok_query6",
+        "cli_query6",
+        "protocol-host",
+    );
 
     let child = spawn_run(&env);
 
     let mut ws = accept_ws(&listener).await;
-    expect_auth(&mut ws).await;
+    expect_auth(&mut ws, "tok_query6").await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
     next_envelope(&mut ws)
         .await
@@ -674,12 +740,18 @@ async fn query_protocol_with_no_args_reports_this_binarys_min_max() {
 async fn query_protocol_with_arg_answers_can_you_speak_n() {
     let env = Env::new();
     let (listener, url) = bind_local().await;
-    env.write_credential(&url, "hlr_live_good", "cli_query7", "protocol-host2");
+    env.write_credential(
+        &url,
+        "hlr_live_good",
+        "tok_query7",
+        "cli_query7",
+        "protocol-host2",
+    );
 
     let child = spawn_run(&env);
 
     let mut ws = accept_ws(&listener).await;
-    expect_auth(&mut ws).await;
+    expect_auth(&mut ws, "tok_query7").await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
     next_envelope(&mut ws)
         .await
@@ -705,12 +777,18 @@ async fn query_protocol_with_arg_answers_can_you_speak_n() {
 async fn query_unknown_cmd_fails_closed_with_error_reply() {
     let env = Env::new();
     let (listener, url) = bind_local().await;
-    env.write_credential(&url, "hlr_live_good", "cli_query8", "unknown-cmd-host");
+    env.write_credential(
+        &url,
+        "hlr_live_good",
+        "tok_query8",
+        "cli_query8",
+        "unknown-cmd-host",
+    );
 
     let child = spawn_run(&env);
 
     let mut ws = accept_ws(&listener).await;
-    expect_auth(&mut ws).await;
+    expect_auth(&mut ws, "tok_query8").await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
     next_envelope(&mut ws)
         .await
@@ -739,12 +817,18 @@ async fn query_unknown_cmd_fails_closed_with_error_reply() {
 async fn hello_advertises_harness_only_when_confirmed_runnable() {
     let env = Env::new().with_fake_executable("opencode");
     let (listener, url) = bind_local().await;
-    env.write_credential(&url, "hlr_live_good", "cli_hello1", "hello-host1");
+    env.write_credential(
+        &url,
+        "hlr_live_good",
+        "tok_hello1",
+        "cli_hello1",
+        "hello-host1",
+    );
 
     let child = spawn_run(&env);
 
     let mut ws = accept_ws(&listener).await;
-    expect_auth(&mut ws).await;
+    expect_auth(&mut ws, "tok_hello1").await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
     let client_hello = next_envelope(&mut ws)
         .await
@@ -772,12 +856,18 @@ async fn hello_advertises_no_harness_when_not_confirmed_runnable() {
     // (ADR-0001), not "configured to use".
     let env = Env::new();
     let (listener, url) = bind_local().await;
-    env.write_credential(&url, "hlr_live_good", "cli_hello2", "hello-host2");
+    env.write_credential(
+        &url,
+        "hlr_live_good",
+        "tok_hello2",
+        "cli_hello2",
+        "hello-host2",
+    );
 
     let child = spawn_run(&env);
 
     let mut ws = accept_ws(&listener).await;
-    expect_auth(&mut ws).await;
+    expect_auth(&mut ws, "tok_hello2").await;
     send_envelope(&mut ws, &server_hello_envelope()).await;
     let client_hello = next_envelope(&mut ws)
         .await

@@ -45,6 +45,11 @@ use crate::server_address::ServerAddress;
 pub struct RedeemedIdentity {
     pub client_id: String,
     pub credential: String,
+    /// The join token's public `token_id` (the part before the `:` in
+    /// `--token <token_id>:<secret>`), needed by [`crate::connection`] to
+    /// send the right `from` on the `auth` envelope (spec §4/§6: `from` is
+    /// the client's `token_id`, not its `client_id`).
+    pub token_id: String,
 }
 
 /// Failure redeeming a join token.
@@ -111,9 +116,14 @@ impl JoinTransport for StubJoinTransport {
             stub_hash(&[token, "credential", hostname]),
             stub_hash(&[hostname, token, &server.to_canonical_url()]),
         );
+        let token_id = format!(
+            "tok_{:016x}",
+            stub_hash(&[&server.to_canonical_url(), "token_id", hostname, token])
+        );
         Ok(RedeemedIdentity {
             client_id,
             credential,
+            token_id,
         })
     }
 }
@@ -205,6 +215,7 @@ async fn redeem_async(
         Body::JoinOk(body) => Ok(RedeemedIdentity {
             client_id: body.client_id,
             credential: body.credential,
+            token_id: token_id.to_string(),
         }),
         Body::Error(ErrorBody { code, message, .. }) => Err(JoinError::Failed(
             message.unwrap_or_else(|| format!("join failed ({code})")),
