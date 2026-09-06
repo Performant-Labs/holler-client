@@ -60,6 +60,7 @@ HOLLER_SERVER_HOST=io ./scripts/run app:local:tunnel
 
 | Command name | Does |
 |---|---|
+| `build` | `cargo build --release` — bare, per the convention's reserved lifecycle verbs (never namespaced) |
 | `app:local:tunnel` | Open the SSH tunnel to `$HOLLER_SERVER_HOST`'s loopback `holler-server serve` port (required until `wss` lands — see holler-server ADR 0004/0010); no-ops if something already owns the port |
 | `app:local:run` | Build, then `holler run --debug=noisy` in the foreground against `session.toml`/`sessions.toml` (or `$HOLLER_CONFIG`). Requires an existing `holler join` — its own error tells you the command if not |
 | `app:local:stop` | `holler detach`, then close the tunnel from `app:local:tunnel` |
