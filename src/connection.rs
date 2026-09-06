@@ -354,6 +354,7 @@ async fn build_presence_sessions(
 /// server remembers anything from before a drop) once the server's hello
 /// has arrived. Never sends or logs the credential in the clear beyond
 /// this one `auth` frame.
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_auth(
     server_url: &str,
     credential: &str,
