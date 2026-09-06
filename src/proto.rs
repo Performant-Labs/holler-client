@@ -28,6 +28,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const CODE_UNAUTHENTICATED: &str = "unauthenticated";
 /// `query.cmd` is not one of `status`/`caps`/`support`/`protocol` (spec §11).
 pub const CODE_UNKNOWN_CMD: &str = "unknown_cmd";
+/// `join`'s secret was not found, already bound, invalidated, revoked, or
+/// expired (spec §4.1, §11; ADR 0015).
+pub const CODE_JOIN_FAILED: &str = "join_failed";
 /// `support` asked with no argument, or `protocol`'s argument isn't a
 /// positive integer (spec §7, §11).
 pub const CODE_UNKNOWN_FEATURE: &str = "unknown_feature";
@@ -46,6 +49,10 @@ pub enum Role {
 /// returning `None` — see [`decode`].
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MessageType {
+    #[serde(rename = "join")]
+    Join,
+    #[serde(rename = "join_ok")]
+    JoinOk,
     #[serde(rename = "auth")]
     Auth,
     #[serde(rename = "hello")]
@@ -70,6 +77,8 @@ pub enum MessageType {
 impl MessageType {
     fn from_wire(s: &str) -> Self {
         match s {
+            "join" => Self::Join,
+            "join_ok" => Self::JoinOk,
             "auth" => Self::Auth,
             "hello" => Self::Hello,
             "ping" => Self::Ping,
@@ -83,6 +92,8 @@ impl MessageType {
 
     pub fn as_wire_str(self) -> &'static str {
         match self {
+            Self::Join => "join",
+            Self::JoinOk => "join_ok",
             Self::Auth => "auth",
             Self::Hello => "hello",
             Self::Ping => "ping",
@@ -104,6 +115,24 @@ pub struct Envelope {
     pub ts: String,
     pub from: String,
     pub body: Body,
+}
+
+/// `join` body (spec §4.1): the one-time join secret plus this machine's
+/// hostname. `secret` must never be logged or persisted beyond the single
+/// redeem call that sends this — see [`crate::join`]'s module docs.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct JoinBody {
+    pub secret: String,
+    pub hostname: String,
+}
+
+/// `join_ok` body (spec §4.1): the durable identity a successful `join`
+/// redeems. The server closes the connection right after sending this —
+/// see [`crate::join::JoinTransport`].
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct JoinOkBody {
+    pub client_id: String,
+    pub credential: String,
 }
 
 /// `auth` body: the client credential (spec §4 — "not the join secret").
@@ -182,6 +211,8 @@ pub struct QueryBody {
 /// v1 type this client doesn't act on yet (see module docs).
 #[derive(Clone, PartialEq, Debug)]
 pub enum Body {
+    Join(JoinBody),
+    JoinOk(JoinOkBody),
     Auth(AuthBody),
     Hello(HelloBody),
     Ping(PingBody),
@@ -227,6 +258,8 @@ impl std::error::Error for DecodeError {}
 /// Serialize an envelope to its wire form (one WebSocket text frame).
 pub fn encode(envelope: &Envelope) -> serde_json::Result<String> {
     let body: Value = match &envelope.body {
+        Body::Join(b) => serde_json::to_value(b)?,
+        Body::JoinOk(b) => serde_json::to_value(b)?,
         Body::Auth(b) => serde_json::to_value(b)?,
         Body::Hello(b) => serde_json::to_value(b)?,
         Body::Ping(b) => serde_json::to_value(b)?,
@@ -289,6 +322,14 @@ pub fn decode(raw: &str) -> Result<Envelope, DecodeError> {
         .ok_or_else(|| DecodeError::Malformed("missing `body`".into()))?;
 
     let body = match msg_type {
+        MessageType::Join => Body::Join(
+            serde_json::from_value(raw_body)
+                .map_err(|e| DecodeError::Malformed(format!("bad `join` body: {e}")))?,
+        ),
+        MessageType::JoinOk => Body::JoinOk(
+            serde_json::from_value(raw_body)
+                .map_err(|e| DecodeError::Malformed(format!("bad `join_ok` body: {e}")))?,
+        ),
         MessageType::Auth => Body::Auth(
             serde_json::from_value(raw_body)
                 .map_err(|e| DecodeError::Malformed(format!("bad `auth` body: {e}")))?,
@@ -349,6 +390,23 @@ fn now_ts() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// Builds this client's `join` envelope (spec §4.1). `from` is the join
+/// token's public `token_id` — this connection has no `client_id` yet, so
+/// unlike every other envelope this crate sends, `from` is not one.
+pub fn join_envelope(token_id: &str, secret: &str, hostname: &str) -> Envelope {
+    Envelope {
+        v: PROTOCOL_VERSION,
+        msg_type: MessageType::Join,
+        id: new_id(),
+        ts: now_ts(),
+        from: token_id.to_string(),
+        body: Body::Join(JoinBody {
+            secret: secret.to_string(),
+            hostname: hostname.to_string(),
+        }),
+    }
 }
 
 /// Builds this client's `auth` envelope (spec §4): the persisted client
@@ -467,6 +525,41 @@ pub fn error_reply(reply_id: &str, from: &str, code: &str, cmd: Option<&str>, me
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join_round_trips_with_token_id_as_from() {
+        let env = join_envelope("tok_7f3a", "hlr_join_sometoken", "kiwi");
+        assert_eq!(env.from, "tok_7f3a");
+        let raw = encode(&env).unwrap();
+        assert!(raw.contains("hlr_join_sometoken"));
+        let decoded = decode(&raw).unwrap();
+        assert_eq!(decoded, env);
+        match decoded.body {
+            Body::Join(JoinBody { secret, hostname }) => {
+                assert_eq!(secret, "hlr_join_sometoken");
+                assert_eq!(hostname, "kiwi");
+            }
+            other => panic!("expected `join`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_ok_round_trips() {
+        let env = Envelope {
+            v: PROTOCOL_VERSION,
+            msg_type: MessageType::JoinOk,
+            id: "req-join".to_string(),
+            ts: now_ts(),
+            from: "server".to_string(),
+            body: Body::JoinOk(JoinOkBody {
+                client_id: "cli_19".to_string(),
+                credential: "hlr_live_abc".to_string(),
+            }),
+        };
+        let raw = encode(&env).unwrap();
+        let decoded = decode(&raw).unwrap();
+        assert_eq!(decoded, env);
+    }
 
     #[test]
     fn auth_round_trips() {
