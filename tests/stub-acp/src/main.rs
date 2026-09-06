@@ -60,10 +60,22 @@
 //! - Unknown methods that arrive as requests get a JSON-RPC
 //!   `-32601 Method not found` error response; as notifications they
 //!   are silently ignored, per JSON-RPC 2.0 semantics.
+//!
+//! - `session/prompt` whose first text content block is exactly
+//!   [`CRASH_SENTINEL`] makes the stub `exit(0)` immediately, without
+//!   emitting a `session/update` or a response. This models a crashed/dead
+//!   agent mid-turn — added for issue #27's client-side test of the
+//!   HTTP-interrupt fallback, which needs a deterministic way to make the
+//!   ACP connection become unusable while a turn is in flight. Opt-in via
+//!   an exact-match sentinel string, so every other prompt is unaffected.
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+
+/// See the crate doc comment above: a `session/prompt` whose text is
+/// exactly this value makes the stub exit immediately instead of replying.
+const CRASH_SENTINEL: &str = "__stub_acp_simulate_crash__";
 
 /// Per-session state the stub tracks across messages.
 #[derive(Default)]
@@ -123,6 +135,16 @@ fn handle_message(msg: &Value, sessions: &mut HashMap<String, Session>, out: &mu
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            let prompt_text = params
+                .get("prompt")
+                .and_then(Value::as_array)
+                .and_then(|blocks| blocks.first())
+                .and_then(|block| block.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if prompt_text == CRASH_SENTINEL {
+                std::process::exit(0);
+            }
             let cancelled = sessions
                 .get_mut(&session_id)
                 .map(|s| std::mem::take(&mut s.cancel_pending))
