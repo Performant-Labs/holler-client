@@ -22,9 +22,28 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-const STATE_DIR_ENV: &str = "HOLLER_STATE_DIR";
+/// Shared with [`crate::connection`]'s state files (`connection_state.json`,
+/// `detach_request`), which live in this same directory alongside
+/// `credential.json`.
+pub(crate) const STATE_DIR_ENV: &str = "HOLLER_STATE_DIR";
 const DEFAULT_STATE_SUBDIR: &str = ".holler";
 const CREDENTIAL_FILE: &str = "credential.json";
+
+/// Resolves `$HOLLER_STATE_DIR`, or `$HOME/.holler` if unset. Shared by
+/// [`CredentialStore::open`] and [`crate::connection::ConnectionStateStore::open`]
+/// so both stores agree on one directory without duplicating this logic.
+pub(crate) fn resolve_state_dir(
+    state_dir_env: Option<String>,
+    home_env: Option<String>,
+) -> Result<PathBuf, CredentialError> {
+    match state_dir_env {
+        Some(dir) => Ok(PathBuf::from(dir)),
+        None => {
+            let home = home_env.ok_or(CredentialError::NoStateDir)?;
+            Ok(PathBuf::from(home).join(DEFAULT_STATE_SUBDIR))
+        }
+    }
+}
 
 /// What's persisted after a successful join.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,13 +122,7 @@ impl CredentialStore {
         state_dir_env: Option<String>,
         home_env: Option<String>,
     ) -> Result<Self, CredentialError> {
-        let dir = match state_dir_env {
-            Some(dir) => PathBuf::from(dir),
-            None => {
-                let home = home_env.ok_or(CredentialError::NoStateDir)?;
-                PathBuf::from(home).join(DEFAULT_STATE_SUBDIR)
-            }
-        };
+        let dir = resolve_state_dir(state_dir_env, home_env)?;
         Ok(CredentialStore {
             path: dir.join(CREDENTIAL_FILE),
         })

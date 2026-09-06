@@ -31,8 +31,17 @@ clap = { version = "4", features = ["derive"] }
 gethostname = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
 toml = "0.8"
+# Issue #24: the live WebSocket session (`holler run`). Same crate and
+# version as holler-server's own choice (its Cargo.toml), so both sides of
+# the circuit exercise the same WebSocket implementation.
+tokio-tungstenite = "0.30.0"
+futures-util = { version = "0.3.34", features = ["sink"] }
+# RFC 3339 envelope timestamps (`ts`), same crate as holler-server's own
+# `hello.rs` uses for the same purpose — avoids hand-rolling date math for
+# a field the wire codec never parses back anyway.
+time = { version = "0.3", features = ["formatting", "parsing"] }
 
 [dev-dependencies]
 tempfile = "3"
