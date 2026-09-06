@@ -49,6 +49,18 @@ Other commands, run locally on this machine (no live `run` process required for 
 
 `--config <path>` works with any of these, not just `run` — pass the same session file so `status`/`caps` report the sessions you actually intend to run, not an empty list.
 
+### Dev scripts
+
+Wraps the connect side of a manual cross-machine test (tunnel + run) per the org's `object:sub-object:verb` script-naming convention ([`Performant-Labs/playbook`](https://github.com/Performant-Labs/playbook/blob/main/frameworks/node/npm-scripts.md)), adapted for a Rust crate with no `package.json` — command names map to plain shell scripts:
+
+| Command name | Script | Does |
+|---|---|---|
+| `app:local:tunnel` | `scripts/local-tunnel.sh` | Open the SSH tunnel to `$HOLLER_SERVER_HOST`'s loopback `holler serve` port (required until `wss` lands — see holler-server ADR 0004/0010); no-ops if something already owns the port |
+| `app:local:run` | `scripts/local-run.sh` | Build, then `holler run --debug=noisy` in the foreground against `session.toml`/`sessions.toml` (or `$HOLLER_CONFIG`). Requires an existing `holler join` — its own error tells you the command if not |
+| `app:local:stop` | `scripts/local-stop.sh` | `holler detach`, then close the tunnel from `app:local:tunnel` |
+
+`--debug=noisy` is the default for `app:local:run` deliberately — this is the dev/test entry point, and full frame visibility (secrets already redacted) is exactly what you want here.
+
 ## Architecture
 
 `holler join` and `holler run` are two separate steps, not one. `join` is a one-shot redeem: it exchanges the server's one-time token for a persisted `client_id` + long-lived credential, then exits — it does not touch any local agent. `run` is the long-lived process: it reads the session config, spawns one ACP subprocess per configured session (via [`agent-client-protocol`](https://github.com/agentclientprotocol/rust-sdk) v1, JSON-RPC over stdio), and only then opens the live WebSocket to the server. A hung or non-conformant harness can't block the connection itself from coming up — `run` still answers `ping`/`query`/`hello` either way, it just can't route `prompt`/`interrupt` to whichever session failed to spawn.
