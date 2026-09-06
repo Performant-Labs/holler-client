@@ -4,7 +4,7 @@ Thin client for the Holler talk circuit (**Rust**). Joins holler-server with a m
 
 ## Quickstart
 
-This repo is the far-machine half of the circuit — it needs a [holler-server](https://github.com/Performant-Labs/holler-server) somewhere to join. On that server, run `holler token mint` first; it prints a ready-to-paste `holler join` command.
+This repo is the far-machine half of the circuit — it needs a [holler-server](https://github.com/Performant-Labs/holler-server) somewhere to join. On that server, run `holler-server token mint` first; it prints a ready-to-paste `holler join` command.
 
 ```
 # 1. Build
@@ -35,7 +35,7 @@ EOF
 holler run --config sessions.toml
 ```
 
-From here, the server side drives the actual conversation (`holler roster`, `holler say <session> "..."`, `holler interrupt <session>`) — see [holler-server](https://github.com/Performant-Labs/holler-server)'s README for that half.
+From here, the server side drives the actual conversation (`holler-server roster`, `holler-server say <session> "..."`, `holler-server interrupt <session>`) — see [holler-server](https://github.com/Performant-Labs/holler-server)'s README for that half.
 
 Other commands, run locally on this machine (no live `run` process required for these — they answer from local probes, not a model):
 
@@ -60,7 +60,7 @@ HOLLER_SERVER_HOST=io ./scripts/run app:local:tunnel
 
 | Command name | Does |
 |---|---|
-| `app:local:tunnel` | Open the SSH tunnel to `$HOLLER_SERVER_HOST`'s loopback `holler serve` port (required until `wss` lands — see holler-server ADR 0004/0010); no-ops if something already owns the port |
+| `app:local:tunnel` | Open the SSH tunnel to `$HOLLER_SERVER_HOST`'s loopback `holler-server serve` port (required until `wss` lands — see holler-server ADR 0004/0010); no-ops if something already owns the port |
 | `app:local:run` | Build, then `holler run --debug=noisy` in the foreground against `session.toml`/`sessions.toml` (or `$HOLLER_CONFIG`). Requires an existing `holler join` — its own error tells you the command if not |
 | `app:local:stop` | `holler detach`, then close the tunnel from `app:local:tunnel` |
 
