@@ -30,12 +30,12 @@
 //!
 //! # Heartbeat and backoff numbers
 //!
-//! [`HEARTBEAT_INTERVAL`] is 15s, matching `holler-server`'s
+//! [`heartbeat_interval`] is 15s by default, matching `holler-server`'s
 //! `research/dropped-connections` memo (`docs/research-dropped-connections.md`):
 //! "3 missed heartbeats = dead" is a near-universal convention (SSH's
 //! `ClientAliveCountMax`/`ServerAliveCountMax` default, Buzz's own
-//! `SLOW_CLIENT_GRACE_LIMIT`), which is why [`STALE_AFTER`] derives as
-//! `HEARTBEAT_INTERVAL * 3` (45s) — the same threshold
+//! `SLOW_CLIENT_GRACE_LIMIT`), which is why [`stale_after`] derives as
+//! `heartbeat_interval() * 3` (45s by default) — the same threshold
 //! `holler-server`'s roster (issue #32) uses to move a session from
 //! `connected` to `reconnecting`. This was originally guessed at 20s
 //! before the memo was found; fixed to avoid a healthy client flapping
@@ -88,15 +88,30 @@ type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 /// This value was originally guessed at 20s before that research memo
 /// was found; fixed here so a healthy client doesn't flap into
 /// "reconnecting" on the server's roster between heartbeats.
-pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+///
+/// Overridable via `HOLLER_HEARTBEAT_INTERVAL_MS` (parsed once per call,
+/// not cached) purely so an integration test can shrink [`stale_after`]'s
+/// window instead of sleeping out a real 45s to prove `mark_connected` is
+/// refreshed on every heartbeat (issue #50) rather than once at connect.
+/// Production code never sets this; the default is unchanged.
+pub fn heartbeat_interval() -> Duration {
+    std::env::var("HOLLER_HEARTBEAT_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(15))
+}
 /// Exponential-backoff base delay (first retry is `random(0, BASE)`).
 pub const BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// Backoff never waits longer than this between reconnect attempts.
 pub const BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// A persisted live-state file older than this is treated as stale (the
 /// `run` process that wrote it likely died without cleaning up), i.e.
-/// "not connected" — three missed heartbeats' worth of grace.
-pub const STALE_AFTER: Duration = Duration::from_secs(HEARTBEAT_INTERVAL.as_secs() * 3);
+/// "not connected" — three missed heartbeats' worth of grace. See
+/// [`heartbeat_interval`] for why this is a function, not a `const`.
+pub fn stale_after() -> Duration {
+    heartbeat_interval() * 3
+}
 /// How often `run`'s session loop polls for a detach request while a
 /// connection is live.
 const DETACH_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -382,7 +397,7 @@ async fn session_loop(
 ) -> LoopExit {
     state.mark_connected();
 
-    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut heartbeat = tokio::time::interval(heartbeat_interval());
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await; // interval's first tick fires immediately; skip it
 
@@ -485,6 +500,18 @@ async fn session_loop(
                     return LoopExit::Dropped("failed to send heartbeat ping".to_string());
                 }
                 awaiting_pong = true;
+                // Issue #50: `mark_connected()` at the top of this
+                // function only stamps `updated_at` once, at connect
+                // time. A connection healthy for longer than
+                // `stale_after()` (with no reconnect to re-stamp it) would
+                // otherwise read as `Disconnected` from
+                // `ConnectionStateStore::current_state` even while very
+                // much alive — which made `holler detach`'s "is there
+                // anything live to detach" guard skip `request_detach()`
+                // entirely. Refreshing here, every heartbeat, keeps the
+                // persisted timestamp within one `heartbeat_interval()` of
+                // now for as long as the connection is actually healthy.
+                state.mark_connected();
             }
             _ = detach_poll.tick() => {
                 if state.is_detach_requested() {
@@ -630,7 +657,7 @@ mod tests {
     fn live_state_missing_file_is_disconnected() {
         let dir = tempfile::tempdir().unwrap();
         let store = ConnectionStateStore::at_dir(dir.path().to_path_buf());
-        assert_eq!(store.current_state(STALE_AFTER), LiveState::Disconnected);
+        assert_eq!(store.current_state(stale_after()), LiveState::Disconnected);
     }
 
     #[test]
@@ -638,7 +665,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ConnectionStateStore::at_dir(dir.path().to_path_buf());
         store.mark_connected();
-        assert_eq!(store.current_state(STALE_AFTER), LiveState::Connected);
+        assert_eq!(store.current_state(stale_after()), LiveState::Connected);
     }
 
     #[test]
@@ -646,7 +673,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ConnectionStateStore::at_dir(dir.path().to_path_buf());
         store.mark_connecting(true);
-        assert_eq!(store.current_state(STALE_AFTER), LiveState::Reconnecting);
+        assert_eq!(store.current_state(stale_after()), LiveState::Reconnecting);
     }
 
     #[test]
@@ -654,7 +681,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = ConnectionStateStore::at_dir(dir.path().to_path_buf());
         store.mark_connecting(false);
-        assert_eq!(store.current_state(STALE_AFTER), LiveState::Connecting);
+        assert_eq!(store.current_state(stale_after()), LiveState::Connecting);
     }
 
     #[test]
@@ -672,7 +699,7 @@ mod tests {
         let store = ConnectionStateStore::at_dir(dir.path().to_path_buf());
         store.mark_connected();
         store.clear();
-        assert_eq!(store.current_state(STALE_AFTER), LiveState::Disconnected);
+        assert_eq!(store.current_state(stale_after()), LiveState::Disconnected);
         store.clear(); // idempotent
     }
 

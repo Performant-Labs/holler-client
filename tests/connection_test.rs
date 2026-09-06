@@ -44,6 +44,8 @@ struct Env {
     /// stand-in for "a body process with sessions configured", the same
     /// role a shipped default used to play.
     config_path: std::path::PathBuf,
+    /// See [`Env::with_heartbeat_interval_ms`].
+    heartbeat_interval_ms: Option<u64>,
 }
 
 impl Env {
@@ -70,6 +72,7 @@ command = ["opencode", "acp"]
             dir,
             path_dir,
             config_path,
+            heartbeat_interval_ms: None,
         }
     }
 
@@ -94,8 +97,21 @@ command = ["opencode", "acp"]
         let mut cmd = holler();
         cmd.env("HOLLER_STATE_DIR", self.dir.path());
         cmd.env("PATH", self.path_dir.path());
+        if let Some(ms) = self.heartbeat_interval_ms {
+            cmd.env("HOLLER_HEARTBEAT_INTERVAL_MS", ms.to_string());
+        }
         cmd.arg("--config").arg(&self.config_path);
         cmd
+    }
+
+    /// Overrides `HOLLER_HEARTBEAT_INTERVAL_MS` on every command this env
+    /// spawns (`holler run` *and* `holler detach`/`status`, so both
+    /// processes agree on the same `stale_after()` window) — see issue
+    /// #50's regression test, which needs a staleness window far shorter
+    /// than the real 45s default to run in well under a second.
+    fn with_heartbeat_interval_ms(mut self, ms: u64) -> Self {
+        self.heartbeat_interval_ms = Some(ms);
+        self
     }
 
     /// Writes `credential.json` directly — standing in for a completed
@@ -489,6 +505,88 @@ async fn detach_closes_a_live_connection_and_the_run_process_exits() {
         .expect("`holler run` should exit once detach is requested");
     assert!(status.success(), "expected a clean exit on detach");
     assert!(!env.dir.path().join("credential.json").exists());
+}
+
+// Needs `multi_thread`: the auto-pong responder task below must keep
+// making progress concurrently with this test's own blocking
+// `std::thread::sleep` polling loops (`wait_for_status`'s style), which a
+// single-threaded runtime would starve it behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn detach_still_works_after_the_connection_has_outlived_one_stale_window() {
+    // Issue #50: `session_loop` used to call `state.mark_connected()`
+    // exactly once, at connect time, never refreshing `updated_at` again.
+    // A connection alive longer than `stale_after()` (with no reconnect
+    // to re-stamp it) then read as `Disconnected` from
+    // `ConnectionStateStore::current_state`, even though it was very much
+    // alive — which made `holler detach`'s "is there anything live to
+    // detach" guard silently skip `request_detach()` entirely, leaving
+    // the `run` process running forever. `current_state`'s staleness
+    // check has whole-second granularity (`OffsetDateTime::unix_timestamp`/
+    // `Duration::as_secs`), so this uses a 2s heartbeat (`stale_after()` =
+    // 6s) rather than a sub-second one — still a small fraction of the
+    // real 45s default, without also fighting that granularity.
+    let env = Env::new().with_heartbeat_interval_ms(2000);
+    let (listener, url) = bind_local().await;
+    env.write_credential(
+        &url,
+        "hlr_live_good",
+        "tok_test6",
+        "cli_test6",
+        "stale-host",
+    );
+
+    let mut child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws, "tok_test6").await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
+
+    // With a 2s heartbeat, this client will send its own `ping` every 2s
+    // and consider the connection dead if a `pong` doesn't come back
+    // within one more interval — so, unlike the other tests in this file
+    // (which finish well inside the real 15s default), this one must
+    // actually answer every heartbeat for the whole test, not just drain
+    // frames at the end.
+    let auto_pong = tokio::spawn(async move {
+        loop {
+            match next_envelope(&mut ws).await {
+                Some(env) if matches!(env.body, Body::Ping(_)) => {
+                    let pong = proto::pong_reply(&env.id, "server", "test-server");
+                    send_envelope(&mut ws, &pong).await;
+                }
+                Some(_) => continue,
+                None => return,
+            }
+        }
+    });
+
+    env.wait_for_status(STATUS_BUDGET, |doc| doc["connected"] == true);
+
+    // Outlive the stale window (6s) while the connection stays healthy
+    // (auto-answered heartbeats keep it that way) — this is exactly the
+    // case the old, never-refreshed timestamp got wrong.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    assert!(
+        env.status_json()["connected"] == true,
+        "connection should still read as connected after outliving a stale window"
+    );
+
+    let detach_out = env.cmd().arg("detach").output().unwrap();
+    assert!(detach_out.status.success(), "{detach_out:?}");
+    assert!(String::from_utf8(detach_out.stdout)
+        .unwrap()
+        .contains("detached"));
+
+    let status = wait_for_exit(&mut child, Duration::from_secs(5)).expect(
+        "`holler run` should exit once detach is requested, even after outliving a stale window",
+    );
+    assert!(status.success(), "expected a clean exit on detach");
+    assert!(!env.dir.path().join("credential.json").exists());
+
+    auto_pong.abort();
 }
 
 // --- Answering inbound `query` (issue #30) ---------------------------------

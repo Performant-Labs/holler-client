@@ -177,11 +177,11 @@ fn run_detach() -> Result<(), String> {
     let was_joined = store.load().map_err(|e| e.to_string())?.is_some();
 
     let state = ConnectionStateStore::open().map_err(|e| e.to_string())?;
-    if state.current_state(connection::STALE_AFTER) != LiveState::Disconnected {
+    if state.current_state(connection::stale_after()) != LiveState::Disconnected {
         state.request_detach().map_err(|e| e.to_string())?;
         let deadline = std::time::Instant::now() + DETACH_WAIT_BUDGET;
         while std::time::Instant::now() < deadline
-            && state.current_state(connection::STALE_AFTER) != LiveState::Disconnected
+            && state.current_state(connection::stale_after()) != LiveState::Disconnected
         {
             std::thread::sleep(DETACH_POLL_INTERVAL);
         }
@@ -215,7 +215,7 @@ fn run_query_local(
     let hostname = current_hostname();
     let registry = config::load(config).map_err(|e| e.to_string())?;
     let live = ConnectionStateStore::open()
-        .map(|s| s.current_state(connection::STALE_AFTER))
+        .map(|s| s.current_state(connection::stale_after()))
         .unwrap_or(LiveState::Disconnected);
 
     let query = QueryBody {
