@@ -13,12 +13,26 @@ path = "src/lib.rs"
 name = "stub-acp"
 path = "tests/stub-acp/src/main.rs"
 
+[[bin]]
+name = "holler"
+path = "src/main.rs"
+
 [dependencies]
 agent-client-protocol = "2.1.0"
 # HTTP interrupt fallback (issue #27) targets a plain-HTTP local agent
 # control endpoint, never HTTPS, so no TLS backend is enabled here.
 reqwest = { version = "0.12", default-features = false }
+# CLI parsing for the `holler` binary (issue #23), same justification as
+# the server's #29 CLI: hand-rolled arg parsing doesn't scale past a
+# couple of flags, and this is the de facto standard crate for it.
+clap = { version = "4", features = ["derive"] }
+# OS hostname for `join`/`hello` (issue #23): std has no portable way to
+# read this, and this crate is a small, widely used single-purpose shim.
+gethostname = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
