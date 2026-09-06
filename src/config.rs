@@ -1,9 +1,9 @@
 //! Body configuration and the local session registry.
 //!
-//! A body process hosts at least two named local sessions (issue #25). Each
-//! session names a harness and the argv used to launch it; sessions are
-//! configured via a TOML file with a top-level `[[session]]` array of
-//! tables, e.g.:
+//! A body process hosts zero or more named local sessions, entirely as
+//! configured — there is no default session. Each session names a harness
+//! and the argv used to launch it; sessions are configured via a TOML file
+//! with a top-level `[[session]]` array of tables, e.g.:
 //!
 //! ```toml
 //! [[session]]
@@ -27,13 +27,6 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// v1 default harness and command, per issue #25 ("v1 default `command` is
-/// `opencode acp`").
-const DEFAULT_HARNESS: &str = "opencode";
-fn default_command() -> Vec<String> {
-    vec!["opencode".to_string(), "acp".to_string()]
-}
-
 /// Configuration for a single local session.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct SessionConfig {
@@ -46,17 +39,6 @@ pub struct SessionConfig {
     /// a program invocation.
     #[serde(default)]
     pub interrupt: Option<String>,
-}
-
-impl SessionConfig {
-    fn default_named(name: &str) -> Self {
-        SessionConfig {
-            name: name.to_string(),
-            harness: DEFAULT_HARNESS.to_string(),
-            command: default_command(),
-            interrupt: None,
-        }
-    }
 }
 
 /// Top-level shape of the TOML config file: a `[[session]]` array of tables.
@@ -101,35 +83,6 @@ impl std::error::Error for ConfigError {
     }
 }
 
-/// Sanitizes a raw OS hostname into something safe to use as a session-name
-/// prefix and, downstream, a filesystem path component (holler-server's
-/// talk-log persistence keys files by session name — issue #33). Real
-/// hostnames routinely contain characters outside `[A-Za-z0-9_-]` (a `.`
-/// domain suffix, an apostrophe in "Andre's-MacBook-Pro", etc.); replace
-/// any run of disallowed characters with a single `-`, trim leading/
-/// trailing `-`, and fall back to `"host"` if that leaves nothing usable
-/// (an empty or all-symbol hostname) so the result is never an empty
-/// prefix.
-fn sanitize_hostname_prefix(hostname: &str) -> String {
-    let mut out = String::with_capacity(hostname.len());
-    let mut last_was_dash = false;
-    for c in hostname.chars() {
-        if c.is_ascii_alphanumeric() || c == '_' {
-            out.push(c);
-            last_was_dash = false;
-        } else if !last_was_dash {
-            out.push('-');
-            last_was_dash = true;
-        }
-    }
-    let trimmed = out.trim_matches('-');
-    if trimmed.is_empty() {
-        "host".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
 /// In-memory registry of a process's local sessions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRegistry {
@@ -149,26 +102,23 @@ impl SessionRegistry {
         Ok(SessionRegistry { sessions })
     }
 
-    /// The built-in default registry: two sessions, `<hostname>-alpha` and
-    /// `<hostname>-beta`, both using the v1 default harness and command.
-    /// Used when no config file is supplied, so "at least two named local
-    /// sessions" holds with zero configuration.
+    /// The empty registry: no sessions. This is what a process gets when no
+    /// config file is supplied (see [`load`]) — there is no default
+    /// session. `holler run` with no config maintains a live connection but
+    /// drives nothing locally until an operator lists sessions explicitly
+    /// in a TOML config file.
     ///
-    /// Prefixed with `hostname` (sanitized via [`sanitize_hostname_prefix`])
-    /// rather than the bare `alpha`/`beta` this used before: the server's
-    /// roster (holler-server issue #32/#33) enforces session names as
-    /// **globally unique** across every joined machine, and a bare
-    /// `alpha`/`beta` default meant any two unconfigured machines collided
-    /// on their very first join — the second one's default sessions were
-    /// silently rejected. A hostname prefix makes the zero-config case
-    /// collision-free without requiring an operator to hand-pick names.
-    pub fn defaults(hostname: &str) -> Self {
-        let prefix = sanitize_hostname_prefix(hostname);
+    /// A "two sessions, `<hostname>-alpha`/`<hostname>-beta`" default used
+    /// to live here (issue #25's "at least two named local sessions"). It
+    /// was removed: that default forced `holler run` to eagerly spawn agent
+    /// subprocesses whether or not the operator wanted them, purely so the
+    /// wire-harness/acceptance-gate tests (which need two concurrent
+    /// sessions to prove per-session routing and interrupt isolation) had
+    /// something to point at with zero setup. That fixture belongs to those
+    /// tests directly now, not to the shipped default.
+    fn empty() -> Self {
         SessionRegistry {
-            sessions: vec![
-                SessionConfig::default_named(&format!("{prefix}-alpha")),
-                SessionConfig::default_named(&format!("{prefix}-beta")),
-            ],
+            sessions: Vec::new(),
         }
     }
 
@@ -272,17 +222,16 @@ pub fn load_from_str(toml_str: &str) -> Result<SessionRegistry, ConfigError> {
 ///
 /// `None` means no config file was supplied by the caller (there is no
 /// implicit conventional-location search); this yields
-/// [`SessionRegistry::defaults`] (prefixed with `hostname`). `Some(path)`
-/// reads and parses that file, failing closed on I/O errors, parse errors,
-/// or duplicate session names — `hostname` is unused in that branch, since
-/// an explicit config file's names are taken as given, not prefixed.
-pub fn load(path: Option<&Path>, hostname: &str) -> Result<SessionRegistry, ConfigError> {
+/// [`SessionRegistry::empty`] — no sessions. `Some(path)` reads and parses
+/// that file, failing closed on I/O errors, parse errors, or duplicate
+/// session names.
+pub fn load(path: Option<&Path>) -> Result<SessionRegistry, ConfigError> {
     match path {
         Some(path) => {
             let contents = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
             load_from_str(&contents)
         }
-        None => Ok(SessionRegistry::defaults(hostname)),
+        None => Ok(SessionRegistry::empty()),
     }
 }
 
@@ -329,37 +278,10 @@ mod tests {
     }
 
     #[test]
-    fn no_config_supplied_falls_back_to_defaults() {
-        let registry = load(None, "kiwi").expect("default load never fails");
+    fn no_config_supplied_yields_empty_registry() {
+        let registry = load(None).expect("default load never fails");
 
-        assert_eq!(registry.session_names(), vec!["kiwi-alpha", "kiwi-beta"]);
-        for name in ["kiwi-alpha", "kiwi-beta"] {
-            let session = registry.get(name).unwrap();
-            assert_eq!(session.harness, "opencode");
-            assert_eq!(session.command, vec!["opencode", "acp"]);
-            assert_eq!(session.interrupt, None);
-        }
-    }
-
-    #[test]
-    fn default_session_names_are_sanitized_and_prefixed_by_hostname() {
-        assert_eq!(sanitize_hostname_prefix("kiwi"), "kiwi");
-        assert_eq!(sanitize_hostname_prefix("Andre's-MacBook-Pro.local"), "Andre-s-MacBook-Pro-local");
-        assert_eq!(sanitize_hostname_prefix("  "), "host");
-        assert_eq!(sanitize_hostname_prefix(""), "host");
-
-        let registry = SessionRegistry::defaults("box-a");
-        let other = SessionRegistry::defaults("box-b");
-        assert_eq!(registry.session_names(), vec!["box-a-alpha", "box-a-beta"]);
-        // The whole point: two different, unconfigured machines must not
-        // produce colliding default session names (holler-server's roster
-        // enforces global uniqueness — issue #32/#33).
-        assert!(
-            registry
-                .session_names()
-                .iter()
-                .all(|n| !other.session_names().contains(n))
-        );
+        assert!(registry.session_names().is_empty());
     }
 
     #[test]
@@ -392,7 +314,9 @@ mod tests {
 
     #[test]
     fn command_is_runnable_false_for_missing_absolute_path() {
-        assert!(!command_is_runnable(&["/no/such/executable/here".to_string()]));
+        assert!(!command_is_runnable(&[
+            "/no/such/executable/here".to_string()
+        ]));
     }
 
     #[test]
@@ -412,7 +336,10 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&exe, perms).unwrap();
 
-        assert!(resolve_executable("fake-harness", std::iter::once(dir.path())));
+        assert!(resolve_executable(
+            "fake-harness",
+            std::iter::once(dir.path())
+        ));
     }
 
     #[cfg(unix)]
@@ -421,7 +348,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("not-executable"), "no shebang, no bits").unwrap();
 
-        assert!(!resolve_executable("not-executable", std::iter::once(dir.path())));
+        assert!(!resolve_executable(
+            "not-executable",
+            std::iter::once(dir.path())
+        ));
     }
 
     #[test]

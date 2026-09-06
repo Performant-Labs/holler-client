@@ -31,13 +31,32 @@ fn holler() -> Command {
 struct Env {
     dir: tempfile::TempDir,
     path_dir: tempfile::TempDir,
+    /// A body config (`--config`) declaring one `opencode` session.
+    /// `SessionRegistry` has no built-in default (every session is
+    /// explicit) — this fixture is this test file's own stand-in for "a
+    /// body process with a session configured".
+    config_path: std::path::PathBuf,
 }
 
 impl Env {
     fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("holler.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[[session]]
+name = "test-opencode"
+harness = "opencode"
+command = ["opencode", "acp"]
+"#,
+        )
+        .unwrap();
         Env {
-            dir: tempfile::tempdir().unwrap(),
-            path_dir: tempfile::tempdir().unwrap(),
+            dir,
+            path_dir,
+            config_path,
         }
     }
 
@@ -58,6 +77,7 @@ impl Env {
         let mut cmd = holler();
         cmd.env("HOLLER_STATE_DIR", self.dir.path());
         cmd.env("PATH", self.path_dir.path());
+        cmd.arg("--config").arg(&self.config_path);
         cmd
     }
 
@@ -129,7 +149,9 @@ fn join_ok_envelope(reply_id: &str, client_id: &str, credential: &str) -> proto:
 /// Waits (off the async runtime, since [`Child::wait_with_output`] is
 /// blocking) for the join process to exit and collects its output.
 fn finish_join(child: Child) -> std::process::Output {
-    child.wait_with_output().expect("failed to wait on `holler join`")
+    child
+        .wait_with_output()
+        .expect("failed to wait on `holler join`")
 }
 
 #[test]
@@ -158,7 +180,11 @@ async fn join_then_status_then_detach_then_status() {
     assert_eq!(body.secret, secret);
     assert!(!body.hostname.is_empty());
 
-    let reply = join_ok_envelope("ignored", "cli_integrationtest", "hlr_live_integrationtestcred");
+    let reply = join_ok_envelope(
+        "ignored",
+        "cli_integrationtest",
+        "hlr_live_integrationtestcred",
+    );
     send_envelope(&mut ws, &reply).await;
 
     // `join` is a one-shot bootstrap (spec §4.1): the client must close
@@ -167,7 +193,9 @@ async fn join_then_status_then_detach_then_status() {
     // the *client* closes it rather than just observing our own close.
     match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
         Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {}
-        other => panic!("expected the client to close the connection after `join_ok`, got {other:?}"),
+        other => {
+            panic!("expected the client to close the connection after `join_ok`, got {other:?}")
+        }
     }
 
     let join_out = finish_join(child);
@@ -219,7 +247,13 @@ fn join_rejects_bad_server_url() {
     let env = Env::new();
     let out = env
         .cmd()
-        .args(["join", "--server", "not-a-url", "--token", "tok_x:hlr_join_x"])
+        .args([
+            "join",
+            "--server",
+            "not-a-url",
+            "--token",
+            "tok_x:hlr_join_x",
+        ])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -234,7 +268,13 @@ fn join_rejects_a_token_with_no_token_id() {
     let env = Env::new();
     let out = env
         .cmd()
-        .args(["join", "--server", "ws://127.0.0.1:1", "--token", "hlr_join_x"])
+        .args([
+            "join",
+            "--server",
+            "ws://127.0.0.1:1",
+            "--token",
+            "hlr_join_x",
+        ])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -263,7 +303,10 @@ async fn join_accepts_ipv6_bracketed_server() {
     let out = finish_join(child);
     assert!(out.status.success(), "{out:?}");
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(stdout.contains(&url), "expected {stdout:?} to contain {url:?}");
+    assert!(
+        stdout.contains(&url),
+        "expected {stdout:?} to contain {url:?}"
+    );
 }
 
 #[test]
@@ -303,7 +346,10 @@ async fn join_reports_join_failed_error_clearly() {
     assert!(!out.status.success());
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(stderr.contains("secret already bound"), "{stderr:?}");
-    assert!(!stderr.contains("hlr_join_bad"), "must never log the secret");
+    assert!(
+        !stderr.contains("hlr_join_bad"),
+        "must never log the secret"
+    );
 
     // Nothing was persisted for a failed join.
     assert!(!env.dir.path().join("credential.json").exists());

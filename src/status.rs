@@ -116,9 +116,31 @@ pub fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SessionConfig;
 
     fn confirmed_opencode() -> Vec<String> {
         vec!["opencode".to_string()]
+    }
+
+    /// A two-session fixture for these tests — `defaults()` used to supply
+    /// this; sessions are now always explicit, so tests that want two build
+    /// them directly.
+    fn two_sessions() -> SessionRegistry {
+        SessionRegistry::from_configs(vec![
+            SessionConfig {
+                name: "testhost-alpha".to_string(),
+                harness: "opencode".to_string(),
+                command: vec!["opencode".to_string(), "acp".to_string()],
+                interrupt: None,
+            },
+            SessionConfig {
+                name: "testhost-beta".to_string(),
+                harness: "opencode".to_string(),
+                command: vec!["opencode".to_string(), "acp".to_string()],
+                interrupt: None,
+            },
+        ])
+        .unwrap()
     }
 
     fn features() -> Vec<String> {
@@ -129,7 +151,7 @@ mod tests {
     fn not_joined_omits_client_id() {
         let status = build(
             None,
-            &SessionRegistry::defaults("testhost"),
+            &two_sessions(),
             "kiwi".to_string(),
             LiveState::Disconnected,
             &confirmed_opencode(),
@@ -148,7 +170,7 @@ mod tests {
     fn joined_includes_client_id() {
         let status = build(
             Some("cli_abc123"),
-            &SessionRegistry::defaults("testhost"),
+            &two_sessions(),
             "kiwi".to_string(),
             LiveState::Disconnected,
             &confirmed_opencode(),
@@ -158,10 +180,10 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_sessions_and_harnesses_are_populated_when_confirmed() {
+    fn configured_sessions_and_harnesses_are_populated_when_confirmed() {
         let status = build(
             None,
-            &SessionRegistry::defaults("testhost"),
+            &two_sessions(),
             "kiwi".to_string(),
             LiveState::Disconnected,
             &confirmed_opencode(),
@@ -170,14 +192,17 @@ mod tests {
         assert_eq!(status.harnesses, vec!["opencode"]);
         assert_eq!(status.sessions.len(), 2);
         assert!(status.sessions.iter().all(|s| !s.busy));
-        assert_eq!(status.features, vec!["ping".to_string(), "query".to_string()]);
+        assert_eq!(
+            status.features,
+            vec!["ping".to_string(), "query".to_string()]
+        );
     }
 
     #[test]
     fn unconfirmed_harnesses_hide_their_sessions() {
         let status = build(
             None,
-            &SessionRegistry::defaults("testhost"),
+            &two_sessions(),
             "kiwi".to_string(),
             LiveState::Disconnected,
             &[], // nothing confirmed runnable
@@ -191,7 +216,7 @@ mod tests {
     fn live_connected_reports_connected_not_reconnecting() {
         let status = build(
             None,
-            &SessionRegistry::defaults("testhost"),
+            &two_sessions(),
             "kiwi".to_string(),
             LiveState::Connected,
             &confirmed_opencode(),
@@ -205,7 +230,7 @@ mod tests {
     fn live_connecting_reports_reconnecting_not_connected() {
         let status = build(
             None,
-            &SessionRegistry::defaults("testhost"),
+            &two_sessions(),
             "kiwi".to_string(),
             LiveState::Connecting,
             &confirmed_opencode(),
@@ -219,7 +244,7 @@ mod tests {
     fn live_reconnecting_reports_reconnecting_not_connected() {
         let status = build(
             None,
-            &SessionRegistry::defaults("testhost"),
+            &two_sessions(),
             "kiwi".to_string(),
             LiveState::Reconnecting,
             &confirmed_opencode(),
