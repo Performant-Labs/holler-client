@@ -181,6 +181,24 @@ fn run_join(server: &str, token: &str, cfg: DebugConfig) -> Result<(), String> {
 }
 
 fn run_run(config: Option<&std::path::Path>, cfg: DebugConfig) -> Result<(), String> {
+    // Emitted before any I/O — the instance lock (non-blocking, but
+    // still a syscall), config/credential file reads, ACP subprocess
+    // spawn (session_manager, up to SESSION_MANAGER_SPAWN_BUDGET, and a
+    // hung harness has no upper bound on the initial spawn call itself),
+    // and the network connect can all take real time or, in the
+    // subprocess/network case, hang outright. A user watching stderr
+    // must see confirmation the binary actually started and logging is
+    // live before any of that, not after the first thing that might get
+    // stuck. Announced only when debug logging is actually on — an Info
+    // line saying "debug logging started" would be noise on every plain
+    // `holler run`.
+    if cfg.is_on() {
+        debug::info(cfg, "logging_started")
+            .field("format", cfg.format.to_string())
+            .field("note", "frames to stderr, secrets redacted")
+            .emit();
+    }
+
     // Issue #52: refuse to start a second `run` against the same state
     // dir rather than racing it. Held for this process's whole lifetime
     // (including a crash — the OS releases it when our file descriptors
