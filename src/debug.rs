@@ -164,6 +164,25 @@ pub fn redact_secret(text: &str, secret: &str) -> String {
     text.replace(secret, REDACTED)
 }
 
+/// Emits one debug line for a wire event, gated by `level`.
+///
+/// `quiet_line()` is used for [`DebugLevel::Quiet`] — a high-level
+/// summary only (direction, envelope `type`, session/query identifiers,
+/// no bodies), per the issue's own example (`DEBUG quiet -> prompt
+/// session=alpha id=01J… from=server`). `noisy_line()` is used for
+/// [`DebugLevel::Noisy`] — the caller is responsible for having already
+/// redacted any secret out of it (see [`redact`]/[`redact_secret`])
+/// before this prints it verbatim. Nothing is printed, and neither
+/// closure runs, at [`DebugLevel::None`] — so building the (potentially
+/// expensive) noisy line never costs anything when debug is off.
+pub fn log(level: DebugLevel, quiet_line: impl FnOnce() -> String, noisy_line: impl FnOnce() -> String) {
+    match level {
+        DebugLevel::None => {}
+        DebugLevel::Quiet => eprintln!("DEBUG quiet {}", quiet_line()),
+        DebugLevel::Noisy => eprintln!("DEBUG noisy {}", noisy_line()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
