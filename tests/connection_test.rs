@@ -22,27 +22,53 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use holler_client::proto::{self, Body, ErrorBody, HelloBody, PingBody, Role};
+use holler_client::proto::{self, Body, ErrorBody, HelloBody, PingBody, QueryBody, Role};
 
 fn holler() -> Command {
     Command::new(env!("CARGO_BIN_EXE_holler"))
 }
 
-/// A fresh, isolated `HOLLER_STATE_DIR` per test.
+/// A fresh, isolated `HOLLER_STATE_DIR` per test, with `$PATH`
+/// deterministically controlled so harness-confirmation checks (issue
+/// #30) never depend on what happens to be installed on the machine
+/// running these tests.
 struct Env {
     dir: tempfile::TempDir,
+    /// Becomes the spawned `holler` process's entire `$PATH`. Empty by
+    /// default, so `opencode` (or any other harness) reads as unconfirmed
+    /// unless a test opts in via [`Env::with_fake_executable`].
+    path_dir: tempfile::TempDir,
 }
 
 impl Env {
     fn new() -> Self {
         Env {
             dir: tempfile::tempdir().unwrap(),
+            path_dir: tempfile::tempdir().unwrap(),
         }
+    }
+
+    /// Places a fake, executable file named `name` on the `$PATH` this
+    /// env's spawned processes see, so a `SessionConfig` naming it as its
+    /// command resolves as "confirmed runnable" — without depending on any
+    /// real harness binary being installed on the test host.
+    fn with_fake_executable(self, name: &str) -> Self {
+        let exe = self.path_dir.path().join(name);
+        std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&exe).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&exe, perms).unwrap();
+        }
+        self
     }
 
     fn cmd(&self) -> Command {
         let mut cmd = holler();
         cmd.env("HOLLER_STATE_DIR", self.dir.path());
+        cmd.env("PATH", self.path_dir.path());
         cmd
     }
 
@@ -209,6 +235,20 @@ fn ping_envelope() -> proto::Envelope {
     }
 }
 
+fn query_envelope(cmd: &str, args: Vec<String>) -> proto::Envelope {
+    proto::Envelope {
+        v: 1,
+        msg_type: proto::MessageType::Query,
+        id: proto::new_id(),
+        ts: "2026-01-01T00:00:00Z".to_string(),
+        from: "server".to_string(),
+        body: Body::Query(QueryBody {
+            cmd: cmd.to_string(),
+            args,
+        }),
+    }
+}
+
 fn unauthenticated_error_envelope() -> proto::Envelope {
     proto::Envelope {
         v: 1,
@@ -371,4 +411,284 @@ async fn detach_closes_a_live_connection_and_the_run_process_exits() {
         .expect("`holler run` should exit once detach is requested");
     assert!(status.success(), "expected a clean exit on detach");
     assert!(!env.dir.path().join("credential.json").exists());
+}
+
+// --- Answering inbound `query` (issue #30) ---------------------------------
+
+#[tokio::test]
+async fn query_status_from_server_is_answered_with_the_real_status_document() {
+    let env = Env::new().with_fake_executable("opencode");
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "cli_query1", "query-host");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws).await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws).await.expect("expected client `hello`");
+
+    let request = query_envelope("status", vec![]);
+    send_envelope(&mut ws, &request).await;
+    let reply = next_envelope(&mut ws).await.expect("expected a `query_ok` reply");
+    assert_eq!(reply.id, request.id, "query_ok must reuse the request id");
+    match reply.body {
+        Body::QueryOk(body) => {
+            assert_eq!(body["cmd"], "status");
+            assert_eq!(body["role"], "client");
+            assert_eq!(body["connected"], true);
+            assert_eq!(body["client_id"], "cli_query1");
+            assert_eq!(body["harnesses"], serde_json::json!(["opencode"]));
+        }
+        other => panic!("expected QueryOk, got {other:?}"),
+    }
+
+    kill(child);
+}
+
+#[tokio::test]
+async fn query_support_reports_true_for_an_implemented_protocol_feature() {
+    let env = Env::new();
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "cli_query2", "support-host");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws).await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws).await.expect("expected client `hello`");
+
+    send_envelope(&mut ws, &query_envelope("support", vec!["ping".to_string()])).await;
+    let reply = next_envelope(&mut ws).await.expect("expected a `query_ok` reply");
+    match reply.body {
+        Body::QueryOk(body) => {
+            assert_eq!(body["ok"], true);
+            assert_eq!(body["kind"], "feature");
+            assert_eq!(body["feature"], "ping");
+        }
+        other => panic!("expected QueryOk, got {other:?}"),
+    }
+
+    kill(child);
+}
+
+#[tokio::test]
+async fn query_support_reports_true_for_confirmed_runnable_harness() {
+    let env = Env::new().with_fake_executable("opencode");
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "cli_query3", "support-host2");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws).await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws).await.expect("expected client `hello`");
+
+    send_envelope(&mut ws, &query_envelope("support", vec!["opencode".to_string()])).await;
+    let reply = next_envelope(&mut ws).await.expect("expected a `query_ok` reply");
+    match reply.body {
+        Body::QueryOk(body) => {
+            assert_eq!(body["ok"], true);
+            assert_eq!(body["kind"], "harness");
+            assert!(body["how"].as_str().unwrap().contains("opencode"));
+        }
+        other => panic!("expected QueryOk, got {other:?}"),
+    }
+
+    kill(child);
+}
+
+#[tokio::test]
+async fn query_support_reports_false_for_a_harness_not_on_path() {
+    // No `with_fake_executable`: the default env's `$PATH` is an empty
+    // tempdir, so `opencode` — configured by `SessionRegistry::defaults()`
+    // — is not confirmed runnable, even though it *is* configured.
+    let env = Env::new();
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "cli_query4", "support-host3");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws).await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws).await.expect("expected client `hello`");
+
+    send_envelope(&mut ws, &query_envelope("support", vec!["opencode".to_string()])).await;
+    let reply = next_envelope(&mut ws).await.expect("expected a `query_ok` reply");
+    match reply.body {
+        Body::QueryOk(body) => {
+            assert_eq!(body["ok"], false);
+            assert_eq!(body["kind"], "harness");
+            assert_eq!(body["reason"], "no adapter");
+        }
+        other => panic!("expected QueryOk, got {other:?}"),
+    }
+
+    kill(child);
+}
+
+#[tokio::test]
+async fn query_caps_reports_a_capability_entry_for_every_known_id() {
+    let env = Env::new();
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "cli_query5", "caps-host");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws).await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws).await.expect("expected client `hello`");
+
+    send_envelope(&mut ws, &query_envelope("caps", vec![])).await;
+    let reply = next_envelope(&mut ws).await.expect("expected a `query_ok` reply");
+    match reply.body {
+        Body::QueryOk(body) => {
+            assert_eq!(body["cmd"], "caps");
+            assert_eq!(body["capabilities"]["ping"]["ok"], true);
+            assert_eq!(body["capabilities"]["claude"]["ok"], false);
+            assert!(body["capabilities"]["opencode"].is_object());
+        }
+        other => panic!("expected QueryOk, got {other:?}"),
+    }
+
+    kill(child);
+}
+
+#[tokio::test]
+async fn query_protocol_with_no_args_reports_this_binarys_min_max() {
+    let env = Env::new();
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "cli_query6", "protocol-host");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws).await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws).await.expect("expected client `hello`");
+
+    send_envelope(&mut ws, &query_envelope("protocol", vec![])).await;
+    let reply = next_envelope(&mut ws).await.expect("expected a `query_ok` reply");
+    match reply.body {
+        Body::QueryOk(body) => {
+            assert_eq!(body["cmd"], "protocol");
+            assert_eq!(body["min"], 1);
+            assert_eq!(body["max"], 1);
+            assert_eq!(body["session"], 1);
+        }
+        other => panic!("expected QueryOk, got {other:?}"),
+    }
+
+    kill(child);
+}
+
+#[tokio::test]
+async fn query_protocol_with_arg_answers_can_you_speak_n() {
+    let env = Env::new();
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "cli_query7", "protocol-host2");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws).await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws).await.expect("expected client `hello`");
+
+    send_envelope(&mut ws, &query_envelope("protocol", vec!["2".to_string()])).await;
+    let reply = next_envelope(&mut ws).await.expect("expected a `query_ok` reply");
+    match reply.body {
+        Body::QueryOk(body) => {
+            assert_eq!(body["ok"], false);
+            assert_eq!(body["asked"], 2);
+            assert_eq!(body["max"], 1);
+        }
+        other => panic!("expected QueryOk, got {other:?}"),
+    }
+
+    kill(child);
+}
+
+#[tokio::test]
+async fn query_unknown_cmd_fails_closed_with_error_reply() {
+    let env = Env::new();
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "cli_query8", "unknown-cmd-host");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws).await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws).await.expect("expected client `hello`");
+
+    let request = query_envelope("summarize", vec![]);
+    send_envelope(&mut ws, &request).await;
+    let reply = next_envelope(&mut ws).await.expect("expected an `error` reply");
+    assert_eq!(reply.id, request.id, "error must reuse the request id");
+    match reply.body {
+        Body::Error(ErrorBody { code, cmd, .. }) => {
+            assert_eq!(code, proto::CODE_UNKNOWN_CMD);
+            assert_eq!(cmd.as_deref(), Some("summarize"));
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    kill(child);
+}
+
+// --- Honest `hello` advertisement (issue #30) ------------------------------
+
+#[tokio::test]
+async fn hello_advertises_harness_only_when_confirmed_runnable() {
+    let env = Env::new().with_fake_executable("opencode");
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "cli_hello1", "hello-host1");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws).await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    let client_hello = next_envelope(&mut ws).await.expect("expected client `hello`");
+    match client_hello.body {
+        Body::Hello(hello) => {
+            assert_eq!(hello.harnesses, vec!["opencode".to_string()]);
+            assert_eq!(hello.sessions.len(), 2, "both default sessions use the confirmed harness");
+            assert!(hello.features.contains(&"query".to_string()));
+        }
+        other => panic!("expected `hello`, got {other:?}"),
+    }
+
+    kill(child);
+}
+
+#[tokio::test]
+async fn hello_advertises_no_harness_when_not_confirmed_runnable() {
+    // Default env: empty `$PATH`, so `opencode` (configured but not
+    // installed) must not be advertised — "advertise only what is real"
+    // (ADR-0001), not "configured to use".
+    let env = Env::new();
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "cli_hello2", "hello-host2");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws).await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    let client_hello = next_envelope(&mut ws).await.expect("expected client `hello`");
+    match client_hello.body {
+        Body::Hello(hello) => {
+            assert!(hello.harnesses.is_empty());
+            assert!(hello.sessions.is_empty());
+        }
+        other => panic!("expected `hello`, got {other:?}"),
+    }
+
+    kill(child);
 }

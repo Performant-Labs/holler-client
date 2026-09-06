@@ -14,8 +14,9 @@ use holler_client::config::SessionRegistry;
 use holler_client::connection::{self, ConnectionStateStore, LiveState};
 use holler_client::credential::{CredentialStore, PersistedCredential};
 use holler_client::join::{JoinTransport, StubJoinTransport};
+use holler_client::proto::{self, QueryBody};
+use holler_client::query;
 use holler_client::server_address::ServerAddress;
-use holler_client::status;
 
 /// How long `holler detach` waits for a live `holler run` process to
 /// notice the detach marker and close its own socket before this
@@ -50,8 +51,25 @@ enum Command {
     /// Disconnect (closing any live connection a `holler run` process
     /// holds) and delete the local credential.
     Detach,
-    /// Print this client's status document.
+    /// Print this client's status document (local `query status`).
     Status,
+    /// Print whether this process supports a protocol feature or harness,
+    /// right now (local `query support <feature>`). Never asks a model.
+    Support {
+        /// A protocol feature id (`ping`, `query`, ...) or harness id
+        /// (`opencode`, `claude`, ...).
+        feature: String,
+    },
+    /// Print the full capability document: status plus every known
+    /// feature/harness's support answer (local `query caps`).
+    Caps,
+    /// General local query form: `holler query <cmd> [args...]`, e.g.
+    /// `holler query protocol` or `holler query protocol 2`.
+    Query {
+        cmd: String,
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -60,7 +78,10 @@ fn main() -> ExitCode {
         Command::Join { server, token } => run_join(&server, &token),
         Command::Run => run_run(),
         Command::Detach => run_detach(),
-        Command::Status => run_status(),
+        Command::Status => run_query_local("status", &[]),
+        Command::Support { feature } => run_query_local("support", std::slice::from_ref(&feature)),
+        Command::Caps => run_query_local("caps", &[]),
+        Command::Query { cmd, args } => run_query_local(&cmd, &args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -106,6 +127,7 @@ fn run_run() -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "not joined; run `holler join` first".to_string())?;
 
+    let registry = SessionRegistry::defaults();
     let state = ConnectionStateStore::open().map_err(|e| e.to_string())?;
     // A prior `run` in this state dir may have died without clearing a
     // detach marker or its own live-state file; start from a clean slate.
@@ -120,6 +142,7 @@ fn run_run() -> Result<(), String> {
                 &credential.credential,
                 &credential.client_id,
                 &credential.hostname,
+                &registry,
                 &state,
             ) => res,
             _ = tokio::signal::ctrl_c() => {
@@ -163,7 +186,12 @@ fn run_detach() -> Result<(), String> {
     Ok(())
 }
 
-fn run_status() -> Result<(), String> {
+/// Answers a local `query` — `status`/`support`/`caps`/`protocol` — the
+/// same way [`holler_client::connection`] answers one arriving on the wire
+/// (`crate::query::dispatch`), so `holler status` and a server's inbound
+/// `query`/`cmd=status` are provably the same document, not two
+/// independently-maintained ones.
+fn run_query_local(cmd: &str, args: &[String]) -> Result<(), String> {
     let store = CredentialStore::open().map_err(|e| e.to_string())?;
     let credential = store.load().map_err(|e| e.to_string())?;
     let registry = SessionRegistry::defaults();
@@ -172,8 +200,21 @@ fn run_status() -> Result<(), String> {
         .map(|s| s.current_state(connection::STALE_AFTER))
         .unwrap_or(LiveState::Disconnected);
 
-    let document = status::build(credential.as_ref(), &registry, hostname, live);
-    let json = serde_json::to_string_pretty(&document).map_err(|e| e.to_string())?;
+    let query = QueryBody {
+        cmd: cmd.to_string(),
+        args: args.to_vec(),
+    };
+    let body = query::dispatch(
+        &query,
+        proto::PROTOCOL_VERSION,
+        credential.as_ref().map(|c| c.client_id.as_str()),
+        &registry,
+        &hostname,
+        live,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let json = serde_json::to_string_pretty(&body).map_err(|e| e.to_string())?;
     println!("{json}");
     Ok(())
 }

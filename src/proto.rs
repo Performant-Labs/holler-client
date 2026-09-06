@@ -8,12 +8,13 @@
 //! repos (see `src/join.rs`'s doc comment), so this is modeled
 //! independently, not imported.
 //!
-//! Every other v1 type (`query`, `query_ok`, `prompt`, `reply`,
-//! `interrupt`, `presence`, `ack`) decodes to [`Body::Unknown`] rather
-//! than failing: this story does not implement the query dispatcher
-//! (issue #30), so a server that sends one of those must not crash or
-//! wedge this connection — it is simply a frame this binary does not
-//! act on yet.
+//! `query` / `query_ok` are added here too (issue #30: answer `status` /
+//! `caps` / `support` / `protocol`). Every other v1 type (`prompt`,
+//! `reply`, `interrupt`, `presence`, `ack`) still decodes to
+//! [`Body::Unknown`] rather than failing — this story does not implement
+//! prompt routing, so a server that sends one of those must not crash or
+//! wedge this connection — it is simply a frame this binary does not act
+//! on yet.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,6 +26,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// `auth` missing, malformed, or the credential does not verify (spec §11).
 pub const CODE_UNAUTHENTICATED: &str = "unauthenticated";
+/// `query.cmd` is not one of `status`/`caps`/`support`/`protocol` (spec §11).
+pub const CODE_UNKNOWN_CMD: &str = "unknown_cmd";
+/// `support` asked with no argument, or `protocol`'s argument isn't a
+/// positive integer (spec §7, §11).
+pub const CODE_UNKNOWN_FEATURE: &str = "unknown_feature";
 
 /// Who is speaking (spec §6).
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -50,9 +56,13 @@ pub enum MessageType {
     Pong,
     #[serde(rename = "error")]
     Error,
-    /// Any other v1 type (`query`, `query_ok`, `prompt`, `reply`,
-    /// `interrupt`, `presence`, `ack`). Carries the original wire string
-    /// so a log line can still name it.
+    #[serde(rename = "query")]
+    Query,
+    #[serde(rename = "query_ok")]
+    QueryOk,
+    /// Any other v1 type (`prompt`, `reply`, `interrupt`, `presence`,
+    /// `ack`). Carries the original wire string so a log line can still
+    /// name it.
     #[serde(other)]
     Unknown,
 }
@@ -65,6 +75,8 @@ impl MessageType {
             "ping" => Self::Ping,
             "pong" => Self::Pong,
             "error" => Self::Error,
+            "query" => Self::Query,
+            "query_ok" => Self::QueryOk,
             _ => Self::Unknown,
         }
     }
@@ -76,6 +88,8 @@ impl MessageType {
             Self::Ping => "ping",
             Self::Pong => "pong",
             Self::Error => "error",
+            Self::Query => "query",
+            Self::QueryOk => "query_ok",
             Self::Unknown => "unknown",
         }
     }
@@ -155,6 +169,15 @@ pub struct ErrorBody {
     pub message: Option<String>,
 }
 
+/// `query` body (spec §7): a command plus string args. **Not** a prompt —
+/// never routed to a model (ADR-0001; `crate::query` is the dispatcher).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct QueryBody {
+    pub cmd: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
 /// One body variant per [`MessageType`], plus [`Body::Unknown`] for any
 /// v1 type this client doesn't act on yet (see module docs).
 #[derive(Clone, PartialEq, Debug)]
@@ -164,8 +187,17 @@ pub enum Body {
     Ping(PingBody),
     Pong(PongBody),
     Error(ErrorBody),
+    Query(QueryBody),
+    /// `query_ok`'s shape depends on `cmd` (spec §7: `status`/`caps`/
+    /// `support`/`protocol` each answer differently), so it is kept as raw
+    /// JSON rather than a typed enum — built by [`crate::query::dispatch`]
+    /// and sent via [`query_ok_reply`]. This client only ever *sends*
+    /// `query_ok`, never needs to parse one it receives (it never issues a
+    /// remote `query` of its own — see `crate::query` module docs), so
+    /// there's no round-trip need for a typed variant here.
+    QueryOk(Value),
     /// An undecoded frame body of a type this client doesn't implement
-    /// (e.g. `query`), kept as raw JSON so nothing is lost from a log.
+    /// (e.g. `prompt`), kept as raw JSON so nothing is lost from a log.
     Unknown(Value),
 }
 
@@ -200,6 +232,8 @@ pub fn encode(envelope: &Envelope) -> serde_json::Result<String> {
         Body::Ping(b) => serde_json::to_value(b)?,
         Body::Pong(b) => serde_json::to_value(b)?,
         Body::Error(b) => serde_json::to_value(b)?,
+        Body::Query(b) => serde_json::to_value(b)?,
+        Body::QueryOk(v) => v.clone(),
         Body::Unknown(v) => v.clone(),
     };
     let out = serde_json::json!({
@@ -275,6 +309,11 @@ pub fn decode(raw: &str) -> Result<Envelope, DecodeError> {
             serde_json::from_value(raw_body)
                 .map_err(|e| DecodeError::Malformed(format!("bad `error` body: {e}")))?,
         ),
+        MessageType::Query => Body::Query(
+            serde_json::from_value(raw_body)
+                .map_err(|e| DecodeError::Malformed(format!("bad `query` body: {e}")))?,
+        ),
+        MessageType::QueryOk => Body::QueryOk(raw_body),
         MessageType::Unknown => Body::Unknown(raw_body),
     };
 
@@ -327,10 +366,20 @@ pub fn auth_envelope(from: &str, credential: &str) -> Envelope {
     }
 }
 
-/// Builds this client's `hello` (spec §6). No sessions advertised yet —
-/// the local session registry isn't wired to the wire until the query
-/// dispatcher (issue #30).
-pub fn client_hello(from: &str, hostname: &str, client_id: &str) -> Envelope {
+/// Builds this client's `hello` (spec §6). `features`/`harnesses`/
+/// `sessions` are the caller's job to compute honestly (issue #30;
+/// ADR-0001 "advertise only what is real") — see
+/// [`crate::connection::connect_and_auth`] for how this binary derives them
+/// from [`crate::query::CLIENT_FEATURES`] and
+/// [`crate::config::SessionRegistry::confirmed_harnesses`].
+pub fn client_hello(
+    from: &str,
+    hostname: &str,
+    client_id: &str,
+    features: Vec<String>,
+    harnesses: Vec<String>,
+    sessions: Vec<HelloSession>,
+) -> Envelope {
     Envelope {
         v: PROTOCOL_VERSION,
         msg_type: MessageType::Hello,
@@ -345,11 +394,11 @@ pub fn client_hello(from: &str, hostname: &str, client_id: &str) -> Envelope {
             hostname: hostname.to_string(),
             token_id: None,
             client_id: Some(client_id.to_string()),
-            harnesses: Vec::new(),
+            harnesses,
             harnesses_known: Vec::new(),
             harnesses_confirmed: Vec::new(),
-            features: vec!["ping".to_string()],
-            sessions: Vec::new(),
+            features,
+            sessions,
         }),
     }
 }
@@ -384,6 +433,37 @@ pub fn pong_reply(reply_id: &str, from: &str, hostname: &str) -> Envelope {
     }
 }
 
+/// This client's reply to an inbound `query` (spec §7). Reuses the
+/// request's `id` for correlation; `body` is already shaped for the
+/// specific `cmd` by [`crate::query::dispatch`].
+pub fn query_ok_reply(reply_id: &str, from: &str, body: Value) -> Envelope {
+    Envelope {
+        v: PROTOCOL_VERSION,
+        msg_type: MessageType::QueryOk,
+        id: reply_id.to_string(),
+        ts: now_ts(),
+        from: from.to_string(),
+        body: Body::QueryOk(body),
+    }
+}
+
+/// A fail-closed `error` reply to a malformed or unrecognized `query`
+/// (spec §11: `unknown_cmd`, `unknown_feature`). Reuses the request's `id`.
+pub fn error_reply(reply_id: &str, from: &str, code: &str, cmd: Option<&str>, message: &str) -> Envelope {
+    Envelope {
+        v: PROTOCOL_VERSION,
+        msg_type: MessageType::Error,
+        id: reply_id.to_string(),
+        ts: now_ts(),
+        from: from.to_string(),
+        body: Body::Error(ErrorBody {
+            code: code.to_string(),
+            cmd: cmd.map(|s| s.to_string()),
+            message: Some(message.to_string()),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,10 +479,64 @@ mod tests {
 
     #[test]
     fn hello_round_trips() {
-        let env = client_hello("cli_1", "kiwi", "cli_1");
+        let env = client_hello(
+            "cli_1",
+            "kiwi",
+            "cli_1",
+            vec!["ping".to_string(), "query".to_string()],
+            vec!["opencode".to_string()],
+            vec![HelloSession {
+                name: "alpha".to_string(),
+                harness: "opencode".to_string(),
+            }],
+        );
         let raw = encode(&env).unwrap();
         let decoded = decode(&raw).unwrap();
         assert_eq!(decoded, env);
+    }
+
+    #[test]
+    fn query_round_trips() {
+        let env = Envelope {
+            v: PROTOCOL_VERSION,
+            msg_type: MessageType::Query,
+            id: new_id(),
+            ts: now_ts(),
+            from: "server".to_string(),
+            body: Body::Query(QueryBody {
+                cmd: "support".to_string(),
+                args: vec!["opencode".to_string()],
+            }),
+        };
+        let raw = encode(&env).unwrap();
+        let decoded = decode(&raw).unwrap();
+        assert_eq!(decoded, env);
+    }
+
+    #[test]
+    fn query_ok_round_trips_arbitrary_body_shape() {
+        let body = serde_json::json!({"cmd": "status", "role": "client"});
+        let env = query_ok_reply("req-1", "cli_1", body.clone());
+        assert_eq!(env.id, "req-1");
+        let raw = encode(&env).unwrap();
+        let decoded = decode(&raw).unwrap();
+        match decoded.body {
+            Body::QueryOk(v) => assert_eq!(v, body),
+            other => panic!("expected QueryOk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_reply_carries_code_and_cmd() {
+        let env = error_reply("req-2", "cli_1", CODE_UNKNOWN_CMD, Some("bogus"), "unknown query cmd");
+        assert_eq!(env.id, "req-2");
+        match env.body {
+            Body::Error(ErrorBody { code, cmd, .. }) => {
+                assert_eq!(code, CODE_UNKNOWN_CMD);
+                assert_eq!(cmd.as_deref(), Some("bogus"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -428,7 +562,10 @@ mod tests {
 
     #[test]
     fn unknown_type_decodes_instead_of_erroring() {
-        let raw = r#"{"v":1,"type":"query","id":"x","ts":"t","from":"server","body":{"cmd":"status","args":[]}}"#;
+        // `prompt` is real v1 vocabulary (spec §5) but not yet implemented
+        // by this client (prompt routing is a later story) — `query` is
+        // now a known type, so it can't stand in for "unrecognized" here.
+        let raw = r#"{"v":1,"type":"prompt","id":"x","ts":"t","from":"server","body":{"session":"alpha","text":"hi"}}"#;
         let decoded = decode(raw).unwrap();
         assert!(matches!(decoded.body, Body::Unknown(_)));
     }

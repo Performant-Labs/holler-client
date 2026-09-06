@@ -68,8 +68,10 @@ use time::OffsetDateTime;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use crate::config::SessionRegistry;
 use crate::credential::{resolve_state_dir, CredentialError, STATE_DIR_ENV};
 use crate::proto::{self, Body, ErrorBody, CODE_UNAUTHENTICATED};
+use crate::query;
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -271,6 +273,7 @@ async fn connect_and_auth(
     credential: &str,
     client_id: &str,
     hostname: &str,
+    registry: &SessionRegistry,
 ) -> Result<WsStream, ConnectError> {
     let (mut ws, _response) = tokio_tungstenite::connect_async(server_url)
         .await
@@ -323,7 +326,20 @@ async fn connect_and_auth(
         }
     }
 
-    let hello = proto::client_hello(client_id, hostname, client_id);
+    // "Advertise only what is real" (ADR-0001): only genuinely-confirmed
+    // runnable harnesses, and only sessions whose harness is one of them.
+    let confirmed = registry.confirmed_harnesses();
+    let sessions = registry
+        .sessions()
+        .iter()
+        .filter(|s| confirmed.contains(&s.harness))
+        .map(|s| proto::HelloSession {
+            name: s.name.clone(),
+            harness: s.harness.clone(),
+        })
+        .collect();
+    let features = query::CLIENT_FEATURES.iter().map(|s| s.to_string()).collect();
+    let hello = proto::client_hello(client_id, hostname, client_id, features, confirmed, sessions);
     let raw = proto::encode(&hello).expect("v1 hello envelope always serializes");
     ws.send(Message::Text(raw.into()))
         .await
@@ -346,7 +362,13 @@ enum LoopExit {
 /// hostname, per the issue), sends this client's own heartbeat `ping` on
 /// [`HEARTBEAT_INTERVAL`], and polls for a detach request. Returns when
 /// the connection ends for any reason.
-async fn session_loop(mut ws: WsStream, client_id: &str, hostname: &str, state: &ConnectionStateStore) -> LoopExit {
+async fn session_loop(
+    mut ws: WsStream,
+    client_id: &str,
+    hostname: &str,
+    registry: &SessionRegistry,
+    state: &ConnectionStateStore,
+) -> LoopExit {
     state.mark_connected();
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -387,9 +409,35 @@ async fn session_loop(mut ws: WsStream, client_id: &str, hostname: &str, state: 
                                     message.unwrap_or_default()
                                 ));
                             }
+                            Body::Query(q) => {
+                                // Inside this loop the socket is, by
+                                // definition, live — no need to consult
+                                // `state`'s file for `LiveState`.
+                                let reply = match query::dispatch(
+                                    &q,
+                                    envelope.v,
+                                    Some(client_id),
+                                    registry,
+                                    hostname,
+                                    LiveState::Connected,
+                                ) {
+                                    Ok(body) => proto::query_ok_reply(&envelope.id, client_id, body),
+                                    Err(err) => proto::error_reply(
+                                        &envelope.id,
+                                        client_id,
+                                        err.code(),
+                                        Some(&q.cmd),
+                                        &err.to_string(),
+                                    ),
+                                };
+                                let Ok(raw) = proto::encode(&reply) else { continue };
+                                if ws.send(Message::Text(raw.into())).await.is_err() {
+                                    return LoopExit::Dropped("failed to send query reply".to_string());
+                                }
+                            }
                             // `hello` / anything not yet implemented
-                            // (query dispatcher is issue #30): nothing to
-                            // act on today.
+                            // (prompt routing is a later story): nothing
+                            // to act on today.
                             _ => {}
                         }
                     }
@@ -486,6 +534,7 @@ pub async fn run(
     credential: &str,
     client_id: &str,
     hostname: &str,
+    registry: &SessionRegistry,
     state: &ConnectionStateStore,
 ) -> Result<(), ConnectError> {
     let mut attempt: u32 = 0;
@@ -498,10 +547,10 @@ pub async fn run(
         }
 
         state.mark_connecting(attempt > 0);
-        match connect_and_auth(server_url, credential, client_id, hostname).await {
+        match connect_and_auth(server_url, credential, client_id, hostname, registry).await {
             Ok(ws) => {
                 attempt = 0; // a successful handshake resets the backoff schedule
-                match session_loop(ws, client_id, hostname, state).await {
+                match session_loop(ws, client_id, hostname, registry, state).await {
                     LoopExit::Detached => {
                         state.clear_detach_request();
                         state.clear();

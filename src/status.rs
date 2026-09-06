@@ -8,21 +8,24 @@
 //! `holler run` process persists to [`crate::connection::ConnectionStateStore`]
 //! (issue #24) — this process has no socket of its own, so it can only
 //! ever report what that file says (or "disconnected" if there is none /
-//! it's stale). `harnesses` and `sessions` come from the locally
-//! configured [`SessionRegistry`] (issue #25), not a live PATH probe (ADR
-//! 0001's "harnesses it can actually drive" probe is a later story) — this
-//! is an honest "configured to use", analogous to the protocol's `known`
-//! vs. `confirmed` distinction, not a claim that the adapter is confirmed
-//! runnable right now.
+//! it's stale). `harnesses` and `sessions` are filtered to
+//! `confirmed_harnesses` (issue #30: `crate::config::SessionRegistry::confirmed_harnesses`,
+//! a real PATH/executable probe) — ADR 0001's "harnesses it can actually
+//! drive", not merely "configured to use". This module takes that list as
+//! an input rather than probing itself, so it stays a pure function of its
+//! arguments and fully unit-testable without touching the filesystem.
 //!
 //! Never includes the credential or join token — only `client_id` is
-//! surfaced, and only when a credential is actually persisted.
+//! surfaced (as a plain `&str`, never the full [`PersistedCredential`], so
+//! this module has no way to leak the credential value even by accident),
+//! and only when one is actually persisted.
+//!
+//! [`PersistedCredential`]: crate::credential::PersistedCredential
 
 use serde::Serialize;
 
 use crate::config::SessionRegistry;
 use crate::connection::LiveState;
-use crate::credential::PersistedCredential;
 
 const PROTOCOL_VERSION: u32 = 1;
 const PROTOCOL_MIN: u32 = 1;
@@ -55,33 +58,32 @@ pub struct ClientStatus {
     pub reconnecting: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    /// Protocol features this binary actually implements right now
+    /// (`crate::query::CLIENT_FEATURES`), not the full v1 vocabulary.
+    pub features: Vec<String>,
     pub harnesses: Vec<String>,
     pub sessions: Vec<SessionStatus>,
 }
 
 /// Builds the status document from currently-persisted state.
 ///
-/// `credential` is `None` when nothing is joined ("not joined"): the
+/// `client_id` is `None` when nothing is joined ("not joined"): the
 /// document is still well-formed, just without a `client_id`. `live` is
 /// this invocation's read of [`crate::connection::ConnectionStateStore`]
-/// — this process has no socket of its own to ask directly.
+/// — this process has no socket of its own to ask directly. `harnesses`
+/// and `sessions` are filtered to `confirmed_harnesses` — see module docs.
 pub fn build(
-    credential: Option<&PersistedCredential>,
+    client_id: Option<&str>,
     registry: &SessionRegistry,
     hostname: String,
     live: LiveState,
+    confirmed_harnesses: &[String],
+    features: Vec<String>,
 ) -> ClientStatus {
-    let mut harnesses: Vec<String> = registry
-        .sessions()
-        .iter()
-        .map(|s| s.harness.clone())
-        .collect();
-    harnesses.sort();
-    harnesses.dedup();
-
     let sessions = registry
         .sessions()
         .iter()
+        .filter(|s| confirmed_harnesses.iter().any(|h| h == &s.harness))
         .map(|s| SessionStatus {
             name: s.name.clone(),
             harness: s.harness.clone(),
@@ -104,8 +106,9 @@ pub fn build(
         hostname,
         connected,
         reconnecting,
-        client_id: credential.map(|c| c.client_id.clone()),
-        harnesses,
+        client_id: client_id.map(|c| c.to_string()),
+        features,
+        harnesses: confirmed_harnesses.to_vec(),
         sessions,
     }
 }
@@ -114,6 +117,14 @@ pub fn build(
 mod tests {
     use super::*;
 
+    fn confirmed_opencode() -> Vec<String> {
+        vec!["opencode".to_string()]
+    }
+
+    fn features() -> Vec<String> {
+        vec!["ping".to_string(), "query".to_string()]
+    }
+
     #[test]
     fn not_joined_omits_client_id() {
         let status = build(
@@ -121,6 +132,8 @@ mod tests {
             &SessionRegistry::defaults(),
             "kiwi".to_string(),
             LiveState::Disconnected,
+            &confirmed_opencode(),
+            features(),
         );
         assert_eq!(status.client_id, None);
         assert_eq!(status.role, "client");
@@ -133,50 +146,45 @@ mod tests {
 
     #[test]
     fn joined_includes_client_id() {
-        let credential = PersistedCredential {
-            client_id: "cli_abc123".to_string(),
-            credential: "hlr_live_shouldnotappear".to_string(),
-            server: "ws://example.com:41807".to_string(),
-            hostname: "kiwi".to_string(),
-        };
         let status = build(
-            Some(&credential),
+            Some("cli_abc123"),
             &SessionRegistry::defaults(),
             "kiwi".to_string(),
             LiveState::Disconnected,
+            &confirmed_opencode(),
+            features(),
         );
         assert_eq!(status.client_id.as_deref(), Some("cli_abc123"));
     }
 
     #[test]
-    fn never_leaks_the_credential_value() {
-        let credential = PersistedCredential {
-            client_id: "cli_abc123".to_string(),
-            credential: "hlr_live_shouldnotappear".to_string(),
-            server: "ws://example.com:41807".to_string(),
-            hostname: "kiwi".to_string(),
-        };
-        let status = build(
-            Some(&credential),
-            &SessionRegistry::defaults(),
-            "kiwi".to_string(),
-            LiveState::Disconnected,
-        );
-        let json = serde_json::to_string(&status).unwrap();
-        assert!(!json.contains("hlr_live_shouldnotappear"));
-    }
-
-    #[test]
-    fn default_registry_sessions_and_harnesses_are_populated() {
+    fn default_registry_sessions_and_harnesses_are_populated_when_confirmed() {
         let status = build(
             None,
             &SessionRegistry::defaults(),
             "kiwi".to_string(),
             LiveState::Disconnected,
+            &confirmed_opencode(),
+            features(),
         );
         assert_eq!(status.harnesses, vec!["opencode"]);
         assert_eq!(status.sessions.len(), 2);
         assert!(status.sessions.iter().all(|s| !s.busy));
+        assert_eq!(status.features, vec!["ping".to_string(), "query".to_string()]);
+    }
+
+    #[test]
+    fn unconfirmed_harnesses_hide_their_sessions() {
+        let status = build(
+            None,
+            &SessionRegistry::defaults(),
+            "kiwi".to_string(),
+            LiveState::Disconnected,
+            &[], // nothing confirmed runnable
+            features(),
+        );
+        assert!(status.harnesses.is_empty());
+        assert!(status.sessions.is_empty());
     }
 
     #[test]
@@ -186,6 +194,8 @@ mod tests {
             &SessionRegistry::defaults(),
             "kiwi".to_string(),
             LiveState::Connected,
+            &confirmed_opencode(),
+            features(),
         );
         assert!(status.connected);
         assert!(!status.reconnecting);
@@ -198,6 +208,8 @@ mod tests {
             &SessionRegistry::defaults(),
             "kiwi".to_string(),
             LiveState::Connecting,
+            &confirmed_opencode(),
+            features(),
         );
         assert!(!status.connected);
         assert!(status.reconnecting);
@@ -210,6 +222,8 @@ mod tests {
             &SessionRegistry::defaults(),
             "kiwi".to_string(),
             LiveState::Reconnecting,
+            &confirmed_opencode(),
+            features(),
         );
         assert!(!status.connected);
         assert!(status.reconnecting);

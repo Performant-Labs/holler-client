@@ -1,6 +1,7 @@
-//! Integration test for `holler join`/`detach`/`status` (issue #23),
-//! driven through the actual built `holler` binary so it exercises real
-//! argument parsing, exit codes, and stdout the way an operator sees them.
+//! Integration test for `holler join`/`detach`/`status`/`support`/`caps`/
+//! `query` (issues #23, #30), driven through the actual built `holler`
+//! binary so it exercises real argument parsing, exit codes, and stdout
+//! the way an operator sees them.
 
 use std::process::Command;
 
@@ -9,21 +10,39 @@ fn holler() -> Command {
 }
 
 /// A fresh, isolated `HOLLER_STATE_DIR` per test so parallel tests never
-/// share a credential file.
+/// share a credential file, with `$PATH` deterministically controlled
+/// (empty by default) so harness-confirmation answers never depend on
+/// what happens to be installed on the machine running these tests.
 struct Env {
     dir: tempfile::TempDir,
+    path_dir: tempfile::TempDir,
 }
 
 impl Env {
     fn new() -> Self {
         Env {
             dir: tempfile::tempdir().unwrap(),
+            path_dir: tempfile::tempdir().unwrap(),
         }
+    }
+
+    fn with_fake_executable(self, name: &str) -> Self {
+        let exe = self.path_dir.path().join(name);
+        std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&exe).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&exe, perms).unwrap();
+        }
+        self
     }
 
     fn cmd(&self) -> Command {
         let mut cmd = holler();
         cmd.env("HOLLER_STATE_DIR", self.dir.path());
+        cmd.env("PATH", self.path_dir.path());
         cmd
     }
 }
@@ -140,4 +159,76 @@ fn rejoin_replaces_previous_identity() {
         String::from_utf8(env.cmd().arg("status").output().unwrap().stdout).unwrap();
 
     assert_ne!(first_status, second_status);
+}
+
+#[test]
+fn support_reports_true_for_an_implemented_protocol_feature() {
+    let env = Env::new();
+    let out = env.cmd().args(["support", "ping"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("\"ok\": true"));
+    assert!(stdout.contains("\"kind\": \"feature\""));
+}
+
+#[test]
+fn support_reports_false_for_an_unconfirmed_harness() {
+    let env = Env::new(); // empty $PATH: "opencode" is configured but not runnable
+    let out = env.cmd().args(["support", "opencode"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("\"ok\": false"));
+    assert!(stdout.contains("\"reason\": \"no adapter\""));
+}
+
+#[test]
+fn support_reports_true_for_a_confirmed_runnable_harness() {
+    let env = Env::new().with_fake_executable("opencode");
+    let out = env.cmd().args(["support", "opencode"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("\"ok\": true"));
+    assert!(stdout.contains("\"kind\": \"harness\""));
+}
+
+#[test]
+fn caps_lists_every_known_protocol_feature_and_harness() {
+    let env = Env::new();
+    let out = env.cmd().arg("caps").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(body["cmd"], "caps");
+    assert!(body["capabilities"]["query"].is_object());
+    assert!(body["capabilities"]["opencode"].is_object());
+}
+
+#[test]
+fn query_protocol_reports_this_binarys_min_max() {
+    let env = Env::new();
+    let out = env.cmd().args(["query", "protocol"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let body: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(body["cmd"], "protocol");
+    assert_eq!(body["min"], 1);
+    assert_eq!(body["max"], 1);
+}
+
+#[test]
+fn query_protocol_with_arg_answers_can_you_speak_n() {
+    let env = Env::new();
+    let out = env.cmd().args(["query", "protocol", "2"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let body: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["asked"], 2);
+}
+
+#[test]
+fn query_unknown_cmd_is_a_clear_cli_failure() {
+    let env = Env::new();
+    let out = env.cmd().args(["query", "summarize"]).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.to_lowercase().contains("unknown"));
 }
