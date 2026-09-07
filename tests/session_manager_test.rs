@@ -31,6 +31,7 @@ fn stub_acp_session(name: &str) -> SessionConfig {
         harness: "stub-acp".to_string(),
         command: vec![env!("CARGO_BIN_EXE_stub-acp").to_string()],
         interrupt: None,
+        ..Default::default()
     }
 }
 

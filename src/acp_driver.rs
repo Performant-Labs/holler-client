@@ -124,7 +124,8 @@ impl From<StopReason> for DriverStopReason {
     }
 }
 
-/// Errors from spawning or driving an ACP session.
+/// Errors from spawning or driving an ACP session, or attaching to an
+/// existing HTTP-driven one (issue #100).
 #[derive(Debug)]
 pub enum DriverError {
     /// `SessionConfig.command` was empty; there is no program to spawn.
@@ -137,6 +138,21 @@ pub enum DriverError {
     /// The driver's background connection task has already ended (e.g. the
     /// agent process exited), so this call could not be serviced.
     Disconnected,
+    /// Attach mode (issue #100, ADR-0005): the configured `session_id`
+    /// does not exist at `endpoint` (404), or `endpoint` could not be
+    /// reached at all. Fails closed -- attach never falls back to
+    /// `session/new` or spawning `command` when this happens.
+    AttachSessionNotFound {
+        endpoint: String,
+        session_id: String,
+        detail: String,
+    },
+    /// An HTTP request to an attached OpenCode's control surface failed
+    /// (connection error, non-2xx status, or a response body that didn't
+    /// parse as expected). Carries a human-readable detail rather than
+    /// `reqwest::Error` itself, matching this module's existing `Acp`
+    /// variant's shape.
+    Http(String),
 }
 
 impl std::fmt::Display for DriverError {
@@ -145,6 +161,16 @@ impl std::fmt::Display for DriverError {
             DriverError::EmptyCommand => write!(f, "session config has an empty command"),
             DriverError::Acp(message) => write!(f, "ACP driver error: {message}"),
             DriverError::Disconnected => write!(f, "ACP driver connection has closed"),
+            DriverError::AttachSessionNotFound {
+                endpoint,
+                session_id,
+                detail,
+            } => write!(
+                f,
+                "attach failed: session '{session_id}' not found at '{endpoint}' ({detail}) -- \
+                 never creating a new session in its place"
+            ),
+            DriverError::Http(message) => write!(f, "attach HTTP driver error: {message}"),
         }
     }
 }
