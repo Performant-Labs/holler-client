@@ -284,7 +284,7 @@ pub async fn list_sessions(endpoint: &str) -> Result<Vec<OcSessionSummary>, Stri
         .json()
         .await
         .map_err(|err| format!("could not parse session list from {endpoint}: {err}"))?;
-    sessions.sort_by(|a, b| b.time.updated.cmp(&a.time.updated));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.time.updated));
     Ok(sessions)
 }
 
