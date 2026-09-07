@@ -4,7 +4,7 @@ Thin client for the Holler talk circuit (**Rust**). Joins holler-server with a m
 
 ## Quickstart
 
-This repo is the far-machine half of the circuit — it needs a [holler-server](https://github.com/Performant-Labs/holler-server) somewhere to join. On that server, run `holler-server token mint` first; it prints a ready-to-paste `holler join` command.
+This repo is the far-machine half of the circuit — it needs a [holler-server](https://github.com/Performant-Labs/holler-server) ([latest release](https://github.com/Performant-Labs/holler-server/releases/latest)) somewhere to join. On that server, run `holler-server token mint` first; it prints a ready-to-paste `holler join` command.
 
 ```
 # 1. Build
@@ -161,4 +161,4 @@ License is `AGPL-3.0-or-later` (see [`LICENSE`](LICENSE) and [ADR-0004](https://
 
 ## Companion repo
 
-[holler-server](https://github.com/Performant-Labs/holler-server) — the hub half of the circuit: mints join tokens, hosts the roster, and routes `say`/`interrupt` to whichever client currently owns a session.
+[holler-server](https://github.com/Performant-Labs/holler-server) — the hub half of the circuit: mints join tokens, hosts the roster, and routes `say`/`interrupt` to whichever client currently owns a session. [Latest release](https://github.com/Performant-Labs/holler-server/releases/latest) (always the newest tag — this link never goes stale).
