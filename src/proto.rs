@@ -43,6 +43,15 @@ pub const CODE_UNKNOWN_SESSION: &str = "unknown_session";
 /// than silently dropping the frame or misreporting a live session as
 /// unknown (issue #49's "not a silent drop or panic" requirement).
 pub const CODE_SESSION_UNAVAILABLE: &str = "session_unavailable";
+/// `answer` names a session that hosts no pending question/permission
+/// right now, or whose `choice` did not resolve to a real option
+/// (holler-server issue #382) — not in the spec's error table (the
+/// wire's `answer` message type is itself an extension beyond the
+/// original v1 vocabulary), added here for the same reason
+/// [`CODE_SESSION_UNAVAILABLE`] was: a precise, typed failure the CLI
+/// can report accurately instead of a silent drop or a misleading
+/// generic timeout.
+pub const CODE_NO_PENDING_ANSWER: &str = "no_pending_answer";
 
 /// Who is speaking (spec §6).
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -82,6 +91,11 @@ pub enum MessageType {
     Reply,
     #[serde(rename = "interrupt")]
     Interrupt,
+    /// server → client: answer a pending question/permission blocking a
+    /// session's turn (holler-server issue #382). A control frame, the
+    /// same shape as `interrupt`.
+    #[serde(rename = "answer")]
+    Answer,
     #[serde(rename = "presence")]
     Presence,
     #[serde(rename = "ack")]
@@ -107,6 +121,7 @@ impl MessageType {
             "prompt" => Self::Prompt,
             "reply" => Self::Reply,
             "interrupt" => Self::Interrupt,
+            "answer" => Self::Answer,
             "presence" => Self::Presence,
             "ack" => Self::Ack,
             _ => Self::Unknown,
@@ -127,6 +142,7 @@ impl MessageType {
             Self::Prompt => "prompt",
             Self::Reply => "reply",
             Self::Interrupt => "interrupt",
+            Self::Answer => "answer",
             Self::Presence => "presence",
             Self::Ack => "ack",
             Self::Unknown => "unknown",
@@ -269,6 +285,19 @@ pub struct InterruptBody {
     pub session: String,
 }
 
+/// `answer` body (holler-server issue #382): the named session's chosen
+/// `choice` for whichever question/permission is currently blocking its
+/// turn. `choice` is opaque on the wire — this client's attach driver
+/// (`crate::http_attach_driver`) is the one that knows the actual
+/// pending request's shape and resolves `choice` against it (an option
+/// index or exact label for a question; `once`/`always`/`reject` for a
+/// permission).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct AnswerBody {
+    pub session: String,
+    pub choice: String,
+}
+
 /// `presence` body (spec §10): this client's session advertise +
 /// heartbeat. The spec leaves each session row's shape open beyond
 /// "sessions" — this client uses the same `{name, harness, busy}` shape
@@ -310,6 +339,7 @@ pub enum Body {
     Prompt(PromptBody),
     Reply(ReplyBody),
     Interrupt(InterruptBody),
+    Answer(AnswerBody),
     Presence(PresenceBody),
     Ack(AckBody),
     /// An undecoded frame body of a type this client doesn't implement,
@@ -355,6 +385,7 @@ pub fn encode(envelope: &Envelope) -> serde_json::Result<String> {
         Body::Prompt(b) => serde_json::to_value(b)?,
         Body::Reply(b) => serde_json::to_value(b)?,
         Body::Interrupt(b) => serde_json::to_value(b)?,
+        Body::Answer(b) => serde_json::to_value(b)?,
         Body::Presence(b) => serde_json::to_value(b)?,
         Body::Ack(b) => serde_json::to_value(b)?,
         Body::Unknown(v) => v.clone(),
@@ -456,6 +487,10 @@ pub fn decode(raw: &str) -> Result<Envelope, DecodeError> {
         MessageType::Interrupt => Body::Interrupt(
             serde_json::from_value(raw_body)
                 .map_err(|e| DecodeError::Malformed(format!("bad `interrupt` body: {e}")))?,
+        ),
+        MessageType::Answer => Body::Answer(
+            serde_json::from_value(raw_body)
+                .map_err(|e| DecodeError::Malformed(format!("bad `answer` body: {e}")))?,
         ),
         MessageType::Presence => Body::Presence(
             serde_json::from_value(raw_body)
@@ -859,6 +894,19 @@ mod tests {
         match decoded.body {
             Body::Interrupt(InterruptBody { session }) => assert_eq!(session, "alpha"),
             other => panic!("expected Interrupt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn answer_round_trips() {
+        let raw = r#"{"v":1,"type":"answer","id":"req-a1","ts":"t","from":"server","body":{"session":"alpha","choice":"once"}}"#;
+        let decoded = decode(raw).unwrap();
+        match decoded.body {
+            Body::Answer(AnswerBody { session, choice }) => {
+                assert_eq!(session, "alpha");
+                assert_eq!(choice, "once");
+            }
+            other => panic!("expected Answer, got {other:?}"),
         }
     }
 

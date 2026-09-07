@@ -36,12 +36,14 @@ use crate::status;
 /// [`crate::session_manager::SessionManager`] and streams replies/acks
 /// back, and every (re)connect sends a real `presence` frame built from
 /// that same manager's state — so both belong here per "advertise only
-/// what is real" (ADR-0001).
-pub const CLIENT_FEATURES: &[&str] = &["ping", "query", "interrupt", "presence"];
+/// what is real" (ADR-0001). `answer` (holler-server issue #382) is
+/// reachable the same way for attach-mode sessions, routed to
+/// [`crate::http_attach_driver::HttpAttachDriver::answer`].
+pub const CLIENT_FEATURES: &[&str] = &["ping", "query", "interrupt", "answer", "presence"];
 
 /// The v1 protocol feature vocabulary (spec §9).
 pub const KNOWN_PROTOCOL_FEATURES: &[&str] =
-    &["interrupt", "presence", "ping", "query", "roster", "token", "wait"];
+    &["interrupt", "answer", "presence", "ping", "query", "roster", "token", "wait"];
 
 /// Client-specific capability ids (issue #102, ADR-0005) — not part of the
 /// wire spec's protocol-feature vocabulary, and not a harness name either,

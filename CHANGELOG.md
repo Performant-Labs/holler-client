@@ -10,6 +10,13 @@ pre-decision history.
 
 ## [Unreleased]
 
+### Enhancements
+
+- Attach mode detects a real OpenCode `question`/permission gate blocking a session's
+  turn (polling `GET /question`/`GET /permission`) and answers it via the new
+  `holler-server answer <session> <choice>` wire path (issue #133) — surfaced as
+  `DriverStatus::Blocked`.
+
 ## [0.1.0] - 2026-09-07
 
 First tagged release. Covers everything since this repo's inception — this file's own
