@@ -245,7 +245,7 @@ fn run_run(config: Option<&std::path::Path>, cfg: DebugConfig) -> Result<(), Str
     // line saying "debug logging started" would be noise on every plain
     // `holler run`.
     if cfg.is_on() {
-        debug::info(cfg, "logging_started")
+        debug::info(cfg, "cli", "logging_started")
             .field("format", cfg.format.to_string())
             .field("note", "frames to stderr, secrets redacted")
             .emit();
@@ -344,7 +344,7 @@ async fn spawn_session_manager(
 
     match tokio::time::timeout(
         SESSION_MANAGER_SPAWN_BUDGET,
-        SessionManager::spawn(&live_registry, None),
+        SessionManager::spawn(&live_registry, None, cfg),
     )
     .await
     {
@@ -353,14 +353,14 @@ async fn spawn_session_manager(
         // connecting without the local sessions an operator configured is
         // exactly the kind of degradation worth alerting on.
         Ok(Err(err)) => {
-            debug::warn(cfg, "sessions")
+            debug::warn(cfg, "cli", "sessions")
                 .field("event", "spawn_failed")
                 .field("reason", err.to_string())
                 .emit();
             None
         }
         Err(_) => {
-            debug::warn(cfg, "sessions")
+            debug::warn(cfg, "cli", "sessions")
                 .field("event", "spawn_timeout")
                 .field(
                     "reason",

@@ -48,6 +48,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::acp_driver::{AcpDriver, DriverError, DriverEvent};
 use crate::config::{SessionConfig, SessionMode, SessionRegistry};
+use crate::debug::{self, DebugConfig};
 use crate::http_attach_driver::HttpAttachDriver;
 
 /// Wraps whichever transport a session's `mode` selects (issue #100,
@@ -64,12 +65,12 @@ enum SessionDriver {
 }
 
 impl SessionDriver {
-    async fn for_config(config: &SessionConfig) -> Result<Self, DriverError> {
+    async fn for_config(config: &SessionConfig, cfg: DebugConfig) -> Result<Self, DriverError> {
         match config.mode {
             SessionMode::Spawn => AcpDriver::spawn(config).await.map(SessionDriver::Acp),
-            SessionMode::Attach => {
-                HttpAttachDriver::attach(config).await.map(SessionDriver::Http)
-            }
+            SessionMode::Attach => HttpAttachDriver::attach(config, cfg)
+                .await
+                .map(SessionDriver::Http),
         }
     }
 
@@ -201,10 +202,11 @@ impl SessionManager {
     pub async fn spawn(
         registry: &SessionRegistry,
         http_fallback_base_url: Option<String>,
+        cfg: DebugConfig,
     ) -> Result<Self, ManagerError> {
         let mut handles = HashMap::with_capacity(registry.sessions().len());
         for config in registry.sessions() {
-            let driver = SessionDriver::for_config(config)
+            let driver = SessionDriver::for_config(config, cfg)
                 .await
                 .map_err(ManagerError::Driver)?;
             let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -212,7 +214,7 @@ impl SessionManager {
             let http = http_fallback_base_url
                 .clone()
                 .map(|base_url| (reqwest::Client::new(), base_url));
-            let task = tokio::spawn(run_session(driver, http, command_rx, event_tx));
+            let task = tokio::spawn(run_session(driver, http, command_rx, event_tx, cfg));
             handles.insert(
                 config.name.clone(),
                 SessionHandle {
@@ -340,6 +342,7 @@ async fn run_session(
     http: Option<(reqwest::Client, String)>,
     mut command_rx: mpsc::UnboundedReceiver<ManagerCommand>,
     event_tx: mpsc::UnboundedSender<DriverEvent>,
+    cfg: DebugConfig,
 ) {
     let mut queue: VecDeque<String> = VecDeque::new();
     let mut busy = false;
@@ -370,7 +373,7 @@ async fn run_session(
                         Some(ManagerCommand::Interrupt(reply_tx)) => {
                             let result = if busy {
                                 let http_ref = http.as_ref().map(|(client, url)| (client, url.as_str()));
-                                attempt_cancel(&driver, http_ref)
+                                attempt_cancel(&driver, http_ref, cfg)
                                     .await
                                     .map(InterruptOutcome::Cancelled)
                             } else {
@@ -410,7 +413,7 @@ async fn run_session(
                 Some(ManagerCommand::Interrupt(reply_tx)) => {
                     let result = if busy {
                         let http_ref = http.as_ref().map(|(client, url)| (client, url.as_str()));
-                        attempt_cancel(&driver, http_ref)
+                        attempt_cancel(&driver, http_ref, cfg)
                             .await
                             .map(InterruptOutcome::Cancelled)
                     } else {
@@ -437,11 +440,20 @@ async fn run_session(
 async fn attempt_cancel(
     driver: &SessionDriver,
     http: Option<(&reqwest::Client, &str)>,
+    cfg: DebugConfig,
 ) -> Result<CancelChannel, ManagerError> {
     match driver {
         SessionDriver::Acp(acp) => match acp.cancel() {
-            Ok(()) => Ok(CancelChannel::Acp),
+            Ok(()) => {
+                debug::local(cfg, "session_manager", "interrupt")
+                    .field("event", "acp_cancel")
+                    .emit();
+                Ok(CancelChannel::Acp)
+            }
             Err(DriverError::Disconnected) => {
+                debug::local(cfg, "session_manager", "interrupt")
+                    .field("event", "http_interrupt_fallback")
+                    .emit();
                 let (client, base_url) = http.ok_or(ManagerError::Disconnected)?;
                 let url = format!(
                     "{}/api/session/{}/interrupt",
@@ -458,6 +470,9 @@ async fn attempt_cancel(
             Err(other) => Err(ManagerError::Driver(other)),
         },
         SessionDriver::Http(http_driver) => {
+            debug::local(cfg, "session_manager", "interrupt")
+                .field("event", "http_interrupt_primary")
+                .emit();
             http_driver
                 .interrupt()
                 .await

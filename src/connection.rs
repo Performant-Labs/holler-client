@@ -393,7 +393,7 @@ async fn connect_and_auth(
 
     let auth = proto::auth_envelope(token_id, credential);
     let raw = proto::encode(&auth).expect("v1 auth envelope always serializes");
-    debug::outgoing(cfg, "auth")
+    debug::outgoing(cfg, "wire", "auth")
         .id(&auth.id)
         .peer(token_id)
         .frame(|| debug::redact_secret(&raw, credential))
@@ -422,7 +422,7 @@ async fn connect_and_auth(
     };
     let envelope = proto::decode(&reply_raw)
         .map_err(|e| ConnectError::Transport(format!("malformed frame awaiting hello: {e}")))?;
-    debug::incoming(cfg, envelope.msg_type.as_wire_str())
+    debug::incoming(cfg, "wire", envelope.msg_type.as_wire_str())
         .id(&envelope.id)
         .peer(&envelope.from)
         .frame(|| reply_raw.clone())
@@ -473,7 +473,7 @@ async fn connect_and_auth(
         sessions,
     );
     let raw = proto::encode(&hello).expect("v1 hello envelope always serializes");
-    debug::outgoing(cfg, "hello")
+    debug::outgoing(cfg, "wire", "hello")
         .id(&hello.id)
         .peer(client_id)
         .field("hostname", hostname)
@@ -487,7 +487,7 @@ async fn connect_and_auth(
         build_presence_sessions(registry, &confirmed, &confirmed_attach, session_manager).await;
     let presence = proto::client_presence(client_id, presence_rows);
     let raw = proto::encode(&presence).expect("v1 presence envelope always serializes");
-    debug::outgoing(cfg, "presence")
+    debug::outgoing(cfg, "wire", "presence")
         .id(&presence.id)
         .peer(client_id)
         .frame(|| raw.clone())
@@ -581,7 +581,7 @@ async fn send_reply_chunks(
     let Ok(raw) = proto::encode(&reply) else {
         return true;
     };
-    let mut outbound = debug::outgoing(cfg, "reply")
+    let mut outbound = debug::outgoing(cfg, "wire", "reply")
         .id(reply_id)
         .peer(client_id)
         .field("session", session)
@@ -659,7 +659,7 @@ async fn session_loop(
                             Body::Prompt(PromptBody { text, .. }) => Some(text.as_str()),
                             _ => None,
                         };
-                        let mut inbound = debug::incoming(cfg, envelope.msg_type.as_wire_str())
+                        let mut inbound = debug::incoming(cfg, "wire", envelope.msg_type.as_wire_str())
                             .id(&envelope.id)
                             .peer(&envelope.from);
                         if let Some(t) = prompt_preview {
@@ -670,7 +670,7 @@ async fn session_loop(
                             Body::Ping(_) => {
                                 let pong = proto::pong_reply(&envelope.id, client_id, hostname);
                                 let Ok(raw) = proto::encode(&pong) else { continue };
-                                debug::outgoing(cfg, "pong")
+                                debug::outgoing(cfg, "wire", "pong")
                                     .id(&envelope.id)
                                     .peer(client_id)
                                     .frame(|| raw.clone())
@@ -718,7 +718,7 @@ async fn session_loop(
                                     ),
                                 };
                                 let Ok(raw) = proto::encode(&reply) else { continue };
-                                debug::outgoing(cfg, reply.msg_type.as_wire_str())
+                                debug::outgoing(cfg, "wire", reply.msg_type.as_wire_str())
                                     .id(&envelope.id)
                                     .peer(client_id)
                                     .field("cmd", q.cmd.as_str())
@@ -760,7 +760,7 @@ async fn session_loop(
                                 };
                                 if let Some(reply) = reply {
                                     let Ok(raw) = proto::encode(&reply) else { continue };
-                                    debug::outgoing(cfg, "error")
+                                    debug::outgoing(cfg, "wire", "error")
                                         .id(&envelope.id)
                                         .peer(client_id)
                                         .field("reason", "unroutable prompt")
@@ -799,7 +799,7 @@ async fn session_loop(
                                     ),
                                 };
                                 let Ok(raw) = proto::encode(&reply) else { continue };
-                                debug::outgoing(cfg, reply.msg_type.as_wire_str())
+                                debug::outgoing(cfg, "wire", reply.msg_type.as_wire_str())
                                     .id(&envelope.id)
                                     .peer(client_id)
                                     .field("session", session.as_str())
@@ -844,7 +844,7 @@ async fn session_loop(
                 }
                 let ping = proto::heartbeat_ping(client_id, hostname);
                 let Ok(raw) = proto::encode(&ping) else { continue };
-                debug::outgoing(cfg, "ping")
+                debug::outgoing(cfg, "wire", "ping")
                     .id(&ping.id)
                     .peer(client_id)
                     .field("kind", "heartbeat")
@@ -1047,7 +1047,7 @@ pub async fn run(
                 .await
                 {
                     LoopExit::Detached => {
-                        debug::local(cfg, "conn")
+                        debug::local(cfg, "wire", "conn")
                             .field("event", "detached")
                             .emit();
                         state.clear_detach_request();
@@ -1058,7 +1058,7 @@ pub async fn run(
                         // Always emitted, at every debug level: this is
                         // the line an operator alerts on, so it must not
                         // vanish just because `--debug` is off.
-                        debug::warn(cfg, "conn")
+                        debug::warn(cfg, "wire", "conn")
                             .field("event", "dropped")
                             .field("reason", reason.as_str())
                             .emit();
@@ -1070,7 +1070,7 @@ pub async fn run(
                 return Err(ConnectError::Unauthenticated(msg));
             }
             Err(ConnectError::Transport(msg)) => {
-                debug::warn(cfg, "conn")
+                debug::warn(cfg, "wire", "conn")
                     .field("event", "connect_failed")
                     .field("reason", msg.as_str())
                     .emit();

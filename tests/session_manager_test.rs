@@ -21,6 +21,7 @@
 
 use holler_client::acp_driver::{DriverEvent, DriverStatus, DriverStopReason};
 use holler_client::config::SessionConfig;
+use holler_client::debug::DebugConfig;
 use holler_client::session_manager::{CancelChannel, InterruptOutcome, ManagerError, SessionManager};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -40,7 +41,7 @@ async fn spawn_manager(names: &[&str]) -> SessionManager {
         names.iter().map(|n| stub_acp_session(n)).collect(),
     )
     .expect("distinct names never collide");
-    SessionManager::spawn(&registry, None)
+    SessionManager::spawn(&registry, None, DebugConfig::default())
         .await
         .expect("manager should spawn stub-acp for every session")
 }
@@ -391,7 +392,7 @@ async fn acp_cancel_unavailable_falls_back_to_http_interrupt() {
         "alpha",
     )])
     .unwrap();
-    let mut manager = SessionManager::spawn(&registry, Some(server.base_url()))
+    let mut manager = SessionManager::spawn(&registry, Some(server.base_url()), DebugConfig::default())
         .await
         .expect("manager should spawn stub-acp");
 

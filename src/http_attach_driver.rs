@@ -54,6 +54,7 @@ use tokio::sync::mpsc;
 
 use crate::acp_driver::{DriverError, DriverEvent, DriverStatus, DriverStopReason};
 use crate::config::SessionConfig;
+use crate::debug::{self, DebugConfig};
 
 enum Command {
     Prompt(String),
@@ -81,6 +82,7 @@ pub struct HttpAttachDriver {
     /// OpenCode's event stream has no cancellation-specific event of its
     /// own to key off instead.
     interrupt_requested: Arc<AtomicBool>,
+    debug: DebugConfig,
 }
 
 impl HttpAttachDriver {
@@ -90,7 +92,7 @@ impl HttpAttachDriver {
     /// `endpoint`/`session_id` are missing (defensive — [`crate::config`]
     /// already validates this at load time) or if the existence check
     /// 404s / the endpoint cannot be reached at all.
-    pub async fn attach(config: &SessionConfig) -> Result<Self, DriverError> {
+    pub async fn attach(config: &SessionConfig, cfg: DebugConfig) -> Result<Self, DriverError> {
         let endpoint = config
             .endpoint
             .clone()
@@ -147,6 +149,7 @@ impl HttpAttachDriver {
                 command_rx,
                 event_tx,
                 loop_interrupt_flag,
+                cfg,
             )
             .await;
         });
@@ -159,6 +162,7 @@ impl HttpAttachDriver {
             endpoint,
             session_id,
             interrupt_requested,
+            debug: cfg,
         })
     }
 
@@ -181,12 +185,18 @@ impl HttpAttachDriver {
             self.endpoint.trim_end_matches('/'),
             self.session_id
         );
+        debug::outgoing(self.debug, "http_attach", "interrupt")
+            .field("session", self.session_id.clone())
+            .emit();
         let response = self
             .client
             .post(&url)
             .send()
             .await
             .map_err(|err| DriverError::Http(err.to_string()))?;
+        debug::incoming(self.debug, "http_attach", "interrupt")
+            .field("status", response.status().as_str())
+            .emit();
         if !response.status().is_success() {
             return Err(DriverError::Http(format!(
                 "interrupt returned HTTP {}",
@@ -370,6 +380,7 @@ async fn run_http_loop(
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     event_tx: mpsc::UnboundedSender<DriverEvent>,
     interrupt_requested: Arc<AtomicBool>,
+    cfg: DebugConfig,
 ) {
     // message id -> role, so a `message.part.updated` (which carries no
     // role of its own) can be attributed correctly. Only assistant text is
@@ -378,10 +389,22 @@ async fn run_http_loop(
     let mut message_roles: HashMap<String, String> = HashMap::new();
 
     let event_url = format!("{}/event", endpoint.trim_end_matches('/'));
+    debug::local(cfg, "http_attach", "sse")
+        .field("event", "connecting")
+        .emit();
     let response = match client.get(&event_url).send().await {
         Ok(resp) => resp,
-        Err(_) => return, // connection lost before it ever started; nothing to drive
+        Err(_) => {
+            // connection lost before it ever started; nothing to drive
+            debug::warn(cfg, "http_attach", "sse")
+                .field("event", "connect_failed")
+                .emit();
+            return;
+        }
     };
+    debug::local(cfg, "http_attach", "sse")
+        .field("event", "connected")
+        .emit();
     let mut byte_stream = response.bytes_stream();
     let mut buffer = String::new();
 
@@ -399,14 +422,27 @@ async fn run_http_loop(
                         let body = serde_json::json!({
                             "parts": [{"type": "text", "text": text}]
                         });
-                        if client.post(&prompt_url).json(&body).send().await.is_err() {
-                            // The attached OpenCode became unreachable mid-session.
-                            // There is no subprocess to detect exiting the way
-                            // AcpDriver's connection task would -- surface this the
-                            // same way a lost ACP connection does: stop producing
-                            // events. The caller's next_event() will observe the
-                            // channel close in that case.
-                            return;
+                        debug::outgoing(cfg, "http_attach", "prompt")
+                            .field("session", session_id.clone())
+                            .emit();
+                        match client.post(&prompt_url).json(&body).send().await {
+                            Ok(response) => {
+                                debug::incoming(cfg, "http_attach", "prompt")
+                                    .field("status", response.status().as_str())
+                                    .emit();
+                            }
+                            Err(_) => {
+                                // The attached OpenCode became unreachable mid-session.
+                                // There is no subprocess to detect exiting the way
+                                // AcpDriver's connection task would -- surface this the
+                                // same way a lost ACP connection does: stop producing
+                                // events. The caller's next_event() will observe the
+                                // channel close in that case.
+                                debug::incoming(cfg, "http_attach", "prompt")
+                                    .field("event", "error")
+                                    .emit();
+                                return;
+                            }
                         }
                         let _ = event_tx.send(DriverEvent::Status(DriverStatus::Working));
                     }
@@ -424,6 +460,9 @@ async fn run_http_loop(
                         if event.properties.session_id.as_deref() != Some(session_id.as_str()) {
                             continue; // another session's event on the shared global stream
                         }
+                        debug::incoming(cfg, "http_attach", "sse_event")
+                            .field("event_type", event.kind.clone())
+                            .emit();
                         handle_event(event, &mut message_roles, &event_tx, &interrupt_requested);
                     }
                 }
@@ -546,7 +585,7 @@ mod live_smoke_tests {
             ..Default::default()
         };
 
-        let mut driver = HttpAttachDriver::attach(&config)
+        let mut driver = HttpAttachDriver::attach(&config, DebugConfig::default())
             .await
             .expect("attach to a real, existing session must succeed");
         assert_eq!(driver.session_id(), session_id);
@@ -597,7 +636,7 @@ mod live_smoke_tests {
             ..Default::default()
         };
 
-        match HttpAttachDriver::attach(&config).await {
+        match HttpAttachDriver::attach(&config, DebugConfig::default()).await {
             Err(DriverError::AttachSessionNotFound { .. }) => {}
             Err(other) => panic!("expected AttachSessionNotFound, got a different error: {other}"),
             Ok(_) => panic!("attach to a missing session_id must fail closed, not succeed"),
