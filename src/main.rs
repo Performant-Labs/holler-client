@@ -105,6 +105,49 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
+    /// Set up attach mode against a real, already-running OpenCode HTTP
+    /// endpoint (issue #109) — replaces hand-rolling
+    /// `curl {endpoint}/session | json.tool` to find a session id.
+    Attach {
+        #[command(subcommand)]
+        action: AttachCommand,
+    },
+}
+
+/// Default OpenCode HTTP endpoint both `attach` subcommands probe when
+/// `--endpoint` is omitted — matches `opencode serve`'s and the bare
+/// `opencode` TUI's own default port, so zero-arg usage against a locally
+/// running OpenCode just works (issue #109's explicit requirement).
+const DEFAULT_ATTACH_ENDPOINT: &str = "http://127.0.0.1:4096";
+
+#[derive(Subcommand)]
+enum AttachCommand {
+    /// List real sessions at an OpenCode endpoint (id, title, updated) —
+    /// pure HTTP GET, never spawns or prompts anything.
+    Sessions {
+        /// OpenCode HTTP endpoint to query.
+        #[arg(long, default_value = DEFAULT_ATTACH_ENDPOINT)]
+        endpoint: String,
+    },
+    /// Write a ready-to-use attach config file.
+    Init {
+        /// OpenCode HTTP endpoint the written config will attach to.
+        #[arg(long, default_value = DEFAULT_ATTACH_ENDPOINT)]
+        endpoint: String,
+        /// Session id to attach to. Defaults to the most recently updated
+        /// session at `--endpoint`.
+        #[arg(long)]
+        session: Option<String>,
+        /// Session name for the written config's `[[session]]` entry.
+        #[arg(long, default_value = "alpha")]
+        name: String,
+        /// Path to write the config to.
+        #[arg(long, default_value = "attach.toml")]
+        out: PathBuf,
+        /// Overwrite `--out` if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -141,6 +184,16 @@ fn main() -> ExitCode {
         }
         Command::Caps => run_query_local("caps", &[], config.as_deref()),
         Command::Query { cmd, args } => run_query_local(&cmd, &args, config.as_deref()),
+        Command::Attach { action } => match action {
+            AttachCommand::Sessions { endpoint } => run_attach_sessions(&endpoint),
+            AttachCommand::Init {
+                endpoint,
+                session,
+                name,
+                out,
+                force,
+            } => run_attach_init(&endpoint, session.as_deref(), &name, &out, force),
+        },
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -387,4 +440,93 @@ fn run_query_local(
     let json = serde_json::to_string_pretty(&body).map_err(|e| e.to_string())?;
     println!("{json}");
     Ok(())
+}
+
+/// `holler attach sessions` (issue #109): pure HTTP GET, no local state
+/// touched, no config file involved — just what's really at `endpoint`
+/// right now.
+fn run_attach_sessions(endpoint: &str) -> Result<(), String> {
+    let sessions = tokio::runtime::Runtime::new()
+        .map_err(|e| e.to_string())?
+        .block_on(holler_client::http_attach_driver::list_sessions(endpoint))?;
+
+    if sessions.is_empty() {
+        println!("no sessions at {endpoint}");
+        return Ok(());
+    }
+
+    println!("{:<28}  {:<24}  UPDATED", "ID", "TITLE");
+    for session in &sessions {
+        println!(
+            "{:<28}  {:<24}  {}",
+            session.id,
+            session.title,
+            format_epoch_millis(session.time.updated)
+        );
+    }
+    Ok(())
+}
+
+/// `holler attach init` (issue #109): auto-picks the most recently updated
+/// session when `--session` is omitted, then writes a ready-to-use attach
+/// config. Pure HTTP GET plus a local file write — never prompts a model,
+/// never touches Herdr (that's #103, explicitly out of scope here).
+fn run_attach_init(
+    endpoint: &str,
+    session: Option<&str>,
+    name: &str,
+    out: &std::path::Path,
+    force: bool,
+) -> Result<(), String> {
+    if out.exists() && !force {
+        return Err(format!(
+            "{} already exists; pass --force to overwrite",
+            out.display()
+        ));
+    }
+
+    let session_id = match session {
+        Some(id) => id.to_string(),
+        None => {
+            let sessions = tokio::runtime::Runtime::new()
+                .map_err(|e| e.to_string())?
+                .block_on(holler_client::http_attach_driver::list_sessions(endpoint))?;
+            sessions
+                .into_iter()
+                .next()
+                .map(|s| s.id)
+                .ok_or_else(|| format!("no sessions at {endpoint}; pass --session explicitly"))?
+        }
+    };
+
+    let session_config = config::SessionConfig {
+        name: name.to_string(),
+        harness: "opencode".to_string(),
+        mode: config::SessionMode::Attach,
+        command: Vec::new(),
+        interrupt: None,
+        endpoint: Some(endpoint.to_string()),
+        session_id: Some(session_id.clone()),
+    };
+    let toml_str = config::render_attach_toml(&session_config).map_err(|e| e.to_string())?;
+
+    std::fs::write(out, toml_str).map_err(|e| e.to_string())?;
+    println!(
+        "wrote {} (name={name}, endpoint={endpoint}, session_id={session_id})",
+        out.display()
+    );
+    Ok(())
+}
+
+/// Formats Unix epoch milliseconds as RFC 3339, or the raw number if it's
+/// somehow out of range — a display nicety, never worth failing the whole
+/// command over.
+fn format_epoch_millis(millis: i64) -> String {
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+
+    match OffsetDateTime::from_unix_timestamp(millis / 1000) {
+        Ok(ts) => ts.format(&Rfc3339).unwrap_or_else(|_| millis.to_string()),
+        Err(_) => millis.to_string(),
+    }
 }
