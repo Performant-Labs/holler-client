@@ -30,6 +30,45 @@ jobs:
         run: cargo test
         shell: pwsh
 
+      # Real cross-process interop tests (holler-server#94's harness):
+      # these are deliberately #[ignore]d in their own files (need a built
+      # sibling holler-server binary + `--ignored`) and were not run
+      # anywhere automatically before this -- see holler-server#313, which
+      # fixed the same gap in scripts/test-run.rb's local runner.
+      # actions/checkout@v4 refuses a `path` outside $GITHUB_WORKSPACE (the
+      # `../holler-server` layout the tests' own doc comments describe is a
+      # local-dev-only convention), so this checks holler-server out as a
+      # subdirectory of the workspace instead -- same effect, a real sibling
+      # checkout to build against, just nested rather than a true sibling.
+      - name: Checkout holler-server (for real interop tests)
+        uses: actions/checkout@v4
+        with:
+          repository: Performant-Labs/holler-server
+          path: holler-server
+
+      - name: Build sibling holler-server binary
+        run: cargo build --release
+        shell: pwsh
+        working-directory: holler-server
+
+      - name: Interop test -- mint/join/run/roster/status/stop
+        env:
+          HOLLER_SERVER_BIN: ${{ github.workspace }}/holler-server/target/release/holler-server
+        run: cargo test --test interop_smoke_test -- --ignored
+        shell: pwsh
+
+      - name: Interop test -- SIGINT/SIGTERM on a live run against a real server
+        env:
+          HOLLER_SERVER_BIN: ${{ github.workspace }}/holler-server/target/release/holler-server
+        run: cargo test --test io_behavior -- --ignored
+        shell: pwsh
+
+      - name: Interop test -- server restart is recovered by the client's reconnect loop
+        env:
+          HOLLER_SERVER_BIN: ${{ github.workspace }}/holler-server/target/release/holler-server
+        run: cargo test --test network -- --ignored
+        shell: pwsh
+
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
         shell: pwsh
