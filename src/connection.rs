@@ -76,6 +76,7 @@ use crate::acp_driver::{DriverEvent, DriverStatus};
 use crate::config::{SessionConfig, SessionRegistry};
 use crate::credential::{resolve_state_dir, CredentialError, STATE_DIR_ENV};
 use crate::debug::{self, DebugConfig};
+use crate::http_attach_driver;
 use crate::proto::{
     self, Body, ErrorBody, InterruptBody, PromptBody, CODE_SESSION_UNAVAILABLE,
     CODE_UNAUTHENTICATED, CODE_UNKNOWN_SESSION,
@@ -304,35 +305,49 @@ impl std::fmt::Display for ConnectError {
 
 impl std::error::Error for ConnectError {}
 
-/// Sessions whose harness is confirmed runnable right now (ADR-0001:
-/// "advertise only what is real") — the one filter `hello`'s `sessions`
-/// list and `presence`'s session rows both apply.
+/// Sessions confirmed real right now (ADR-0001: "advertise only what is
+/// real") — spawn sessions via `confirmed_harnesses` (PATH/executable
+/// check), attach sessions via `confirmed_attach_sessions` (a real HTTP
+/// probe result, by session *name* since several attach sessions can share
+/// one harness id — issue #102). The one filter `hello`'s `sessions` list
+/// and `presence`'s session rows both apply.
 fn confirmed_sessions<'a>(
     registry: &'a SessionRegistry,
-    confirmed: &[String],
+    confirmed_harnesses: &[String],
+    confirmed_attach_sessions: &[String],
 ) -> Vec<&'a SessionConfig> {
     registry
         .sessions()
         .iter()
-        .filter(|s| confirmed.contains(&s.harness))
+        .filter(|s| {
+            if s.is_attach() {
+                confirmed_attach_sessions.iter().any(|n| n == &s.name)
+            } else {
+                confirmed_harnesses.contains(&s.harness)
+            }
+        })
         .collect()
 }
 
 /// Builds this connection's `presence` session rows (issue #49): one
-/// `{name, harness, busy}` row — the same shape `holler status` reports
-/// ([`SessionStatus`]) — per confirmed session, `busy` read live from
-/// `manager` when one is running. A session with no live
-/// [`SessionManager`] entry (spawning it failed; see
+/// `{name, harness, busy, mode?, harness_session_id?}` row — the same shape
+/// `holler status` reports ([`SessionStatus`]) — per confirmed session,
+/// `busy` read live from `manager` when one is running. A session with no
+/// live [`SessionManager`] entry (spawning it failed; see
 /// `crate::main`/`run_run`) reports `busy: false` — hello's own sessions
 /// list already only advertises this same confirmed set, so this never
-/// claims a session is real when nothing backs it.
+/// claims a session is real when nothing backs it. `mode`/`harness_session_id`
+/// are populated for attach sessions only (issue #102) — omitted (not
+/// `"spawn"`/absent-string) for spawn sessions, so an old decoder that has
+/// never heard of attach mode sees exactly the shape it always has.
 async fn build_presence_sessions(
     registry: &SessionRegistry,
-    confirmed: &[String],
+    confirmed_harnesses: &[String],
+    confirmed_attach_sessions: &[String],
     manager: Option<&SessionManager>,
 ) -> Vec<serde_json::Value> {
     let mut rows = Vec::new();
-    for session in confirmed_sessions(registry, confirmed) {
+    for session in confirmed_sessions(registry, confirmed_harnesses, confirmed_attach_sessions) {
         let busy = match manager {
             Some(m) => m.is_busy(&session.name).await.unwrap_or(false),
             None => false,
@@ -341,6 +356,12 @@ async fn build_presence_sessions(
             name: session.name.clone(),
             harness: session.harness.clone(),
             busy,
+            mode: if session.is_attach() { Some("attach") } else { None },
+            harness_session_id: if session.is_attach() {
+                session.session_id.clone()
+            } else {
+                None
+            },
         };
         rows.push(serde_json::to_value(status).expect("SessionStatus always serializes"));
     }
@@ -428,9 +449,11 @@ async fn connect_and_auth(
     }
 
     // "Advertise only what is real" (ADR-0001): only genuinely-confirmed
-    // runnable harnesses, and only sessions whose harness is one of them.
+    // runnable harnesses, and only sessions whose harness is one of them
+    // (spawn) or whose HTTP endpoint answers right now (attach, issue #102).
     let confirmed = registry.confirmed_harnesses();
-    let sessions = confirmed_sessions(registry, &confirmed)
+    let confirmed_attach = http_attach_driver::confirmed_attach_sessions(registry).await;
+    let sessions = confirmed_sessions(registry, &confirmed, &confirmed_attach)
         .into_iter()
         .map(|s| proto::HelloSession {
             name: s.name.clone(),
@@ -460,7 +483,8 @@ async fn connect_and_auth(
         .await
         .map_err(|e| ConnectError::Transport(format!("failed to send client hello: {e}")))?;
 
-    let presence_rows = build_presence_sessions(registry, &confirmed, session_manager).await;
+    let presence_rows =
+        build_presence_sessions(registry, &confirmed, &confirmed_attach, session_manager).await;
     let presence = proto::client_presence(client_id, presence_rows);
     let raw = proto::encode(&presence).expect("v1 presence envelope always serializes");
     debug::outgoing(cfg, "presence")
@@ -667,7 +691,14 @@ async fn session_loop(
                             Body::Query(q) => {
                                 // Inside this loop the socket is, by
                                 // definition, live — no need to consult
-                                // `state`'s file for `LiveState`.
+                                // `state`'s file for `LiveState`. Attach
+                                // confirmation (issue #102) needs a real
+                                // HTTP probe, which `query::dispatch` can't
+                                // do itself (it stays a pure function) —
+                                // gathered here, right before answering,
+                                // same as the presence path below.
+                                let confirmed_attach =
+                                    http_attach_driver::confirmed_attach_sessions(registry).await;
                                 let reply = match query::dispatch(
                                     &q,
                                     envelope.v,
@@ -675,6 +706,7 @@ async fn session_loop(
                                     registry,
                                     hostname,
                                     LiveState::Connected,
+                                    &confirmed_attach,
                                 ) {
                                     Ok(body) => proto::query_ok_reply(&envelope.id, client_id, body),
                                     Err(err) => proto::error_reply(

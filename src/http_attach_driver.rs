@@ -222,6 +222,52 @@ impl HttpAttachDriver {
     }
 }
 
+/// Real HTTP existence probe for one attach session — `true` iff `GET
+/// {endpoint}/api/session/{session_id}` returns success, right now (issue
+/// #102). This is the same check [`HttpAttachDriver::attach`] performs
+/// before it will drive a session, extracted standalone because `support
+/// opencode-http`/`status`/`presence` (issue #102) only need a yes/no
+/// answer, not a driver — asking for one just to throw it away would spawn
+/// this session's background event-listener task for no reason. One real
+/// GET, no retry loop: "is my configured id real right now," not "wait
+/// until it becomes real."
+pub async fn probe_session_exists(endpoint: &str, session_id: &str) -> bool {
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/session/{}", endpoint.trim_end_matches('/'), session_id);
+    match client.get(&url).send().await {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// Probes every attach-mode session in `registry` for real, right now,
+/// returning the names of the ones whose configured `endpoint`/`session_id`
+/// currently answer. Spawn sessions are never included here — they're
+/// confirmed via [`crate::config::SessionRegistry::confirmed_harnesses`]'s
+/// PATH/executable check instead (issue #99's explicit "attach sessions are
+/// not confirmed by PATH-checking `opencode`" rule, and its mirror: spawn
+/// sessions are not confirmed by an HTTP probe they have nothing to do
+/// with). An attach session missing `endpoint`/`session_id` is skipped
+/// (defensive — [`crate::config`] already rejects this at load time, so it
+/// should never actually happen) rather than probing a malformed URL.
+pub async fn confirmed_attach_sessions(
+    registry: &crate::config::SessionRegistry,
+) -> Vec<String> {
+    let mut confirmed = Vec::new();
+    for session in registry.sessions().iter().filter(|s| s.is_attach()) {
+        let (Some(endpoint), Some(session_id)) = (&session.endpoint, &session.session_id) else {
+            continue;
+        };
+        if endpoint.is_empty() || session_id.is_empty() {
+            continue;
+        }
+        if probe_session_exists(endpoint, session_id).await {
+            confirmed.push(session.name.clone());
+        }
+    }
+    confirmed
+}
+
 /// A single global SSE event's shape this driver cares about. OpenCode's
 /// event payload has many more fields/variants than this; `serde`'s
 /// default behavior (ignore unknown fields on a struct, unless `deny_unknown_fields`
