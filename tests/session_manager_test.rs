@@ -272,6 +272,47 @@ async fn take_event_channels_drains_events_independently_per_session() {
     manager.shutdown().await;
 }
 
+/// hlrclnt-1502 (Concurrency & Rapid Requests): every other multi-session
+/// test in this file exercises exactly two sessions. That's enough to prove
+/// isolation between *a* pair, but a config listing many real sessions is
+/// the actual documented use case (issue #27's own example roster). This
+/// spawns a double-digit session count and proves the manager scales past
+/// "two" without cross-talk: every session is independently promptable,
+/// every session's turn completes with its own correct sequence, and no
+/// session's events leak into another's channel.
+#[tokio::test]
+async fn many_session_config_keeps_every_session_independently_promptable() {
+    const SESSION_COUNT: usize = 12;
+    let names: Vec<String> = (0..SESSION_COUNT).map(|i| format!("session-{i:02}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut manager = spawn_manager(&name_refs).await;
+
+    let mut listed = manager.session_names();
+    listed.sort();
+    let mut expected = names.clone();
+    expected.sort();
+    assert_eq!(
+        listed, expected,
+        "manager must track every configured session, not just the first few"
+    );
+
+    // Prompt all of them before draining any -- proves the manager can hold
+    // many turns in flight simultaneously, not just serialize pairs.
+    for name in &names {
+        manager.prompt(name, "hello").expect("prompt should send");
+    }
+
+    // Each session's own turn must complete with the exact expected
+    // sequence, and interrupting/draining one must never surface another's
+    // events (mirrors interrupting_one_session_does_not_affect_its_sibling,
+    // just at N sessions instead of 2).
+    for name in &names {
+        expect_turn(&mut manager, name, DriverStopReason::EndTurn).await;
+    }
+
+    manager.shutdown().await;
+}
+
 #[tokio::test]
 async fn unknown_session_is_a_well_defined_error_not_a_panic() {
     let manager = spawn_manager(&["alpha"]).await;
