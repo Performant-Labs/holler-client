@@ -55,7 +55,10 @@ pub fn wait_for<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> O
     }
 }
 
-fn holler_cmd(state_dir: &StateDir) -> Command {
+/// Builds a `holler` `Command` against `state_dir`. Exposed (not just used
+/// internally) so tests needing custom stdio/signal handling can still go
+/// through one place.
+pub fn holler_cmd(state_dir: &StateDir) -> Command {
     let mut cmd = Command::cargo_bin("holler").expect(
         "holler binary not built -- run `cargo build` (or `cargo test`, which builds it \
          automatically) before invoking harness helpers directly",
