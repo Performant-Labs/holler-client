@@ -23,9 +23,15 @@ but the process is identical. This page only covers what's specific to holler-cl
   ran" rule applies.
 - **Release binary**: `cargo build --release` produces `target/release/holler` here (not
   `holler-client`) — that's the file to attach to the GitHub Release.
+- **Known issues to check before release notes**: `gh issue list --repo Performant-Labs/holler-client
+  --label bug --state open` — this repo's own set, distinct from holler-server's (e.g. holler-client#60,
+  no Windows support). The policy itself (known issues aren't blockers for a beta, but must be
+  checked and named in the notes) is holler-server's `docs/releasing.md` "Known issues" section —
+  identical here, not repeated.
 
 Everything else — version bump rules, tag format (`vX.Y.Z`, signed/annotated), `CHANGELOG.md`
 conventions, the two-tier "tag+CHANGELOG always, GitHub Release with binaries as a confirmed
 extra" shape, and the step-by-step sequence — is exactly as documented in holler-server's page
-linked above. For the actual checklist to run through each time, see the pinned release-checklist
-issue referenced from [issue #54](https://github.com/Performant-Labs/holler-client/issues/54).
+linked above. For the actual checklist to run through each time, see this repo's pinned
+release-checklist issue — [#119](https://github.com/Performant-Labs/holler-client/issues/119) for
+the first release; a fresh one gets filed per release going forward.
