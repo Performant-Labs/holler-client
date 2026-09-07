@@ -179,7 +179,7 @@ async fn redeem_async(
     cfg: DebugConfig,
 ) -> Result<RedeemedIdentity, JoinError> {
     if cfg.is_on() {
-        debug::info(cfg, "logging_started")
+        debug::info(cfg, "cli", "logging_started")
             .field("format", cfg.format.to_string())
             .field("note", "frames to stderr, secrets redacted")
             .emit();
@@ -191,7 +191,7 @@ async fn redeem_async(
 
     let envelope = proto::join_envelope(token_id, secret, hostname);
     let raw = proto::encode(&envelope).expect("v1 join envelope always serializes");
-    debug::outgoing(cfg, "join")
+    debug::outgoing(cfg, "wire", "join")
         .id(&envelope.id)
         .peer(token_id)
         .frame(|| debug::redact_secret(&raw, secret))
@@ -229,7 +229,7 @@ async fn redeem_async(
         .map_err(|e| JoinError::Failed(format!("malformed frame awaiting join_ok: {e}")))?;
     match reply.body {
         Body::JoinOk(body) => {
-            debug::incoming(cfg, "join_ok")
+            debug::incoming(cfg, "wire", "join_ok")
                 .id(&reply.id)
                 .peer(&body.client_id)
                 .frame(|| debug::redact_secret(&reply_raw, &body.credential))
@@ -241,7 +241,7 @@ async fn redeem_async(
             })
         }
         Body::Error(ErrorBody { code, message, .. }) => {
-            debug::incoming(cfg, "error")
+            debug::incoming(cfg, "wire", "error")
                 .id(&reply.id)
                 .field("code", code.as_str())
                 .frame(|| reply_raw.clone())

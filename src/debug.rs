@@ -327,6 +327,12 @@ impl Direction {
 /// gap before the first `k=v` pair.
 const TYPE_COLUMN_WIDTH: usize = 10;
 
+/// Width the `component` column is padded to in [`LogFormat::Text`]. The
+/// longest component name in use across this crate and holler-server's
+/// mirrored set is `session_manager` (15 chars); one space of slack
+/// keeps a gap before the `type` column.
+const COMPONENT_COLUMN_WIDTH: usize = 16;
+
 /// How many leading characters of an id/peer survive into a `text` line.
 /// Enough to stay distinctive past a `cli_`/`tok_` prefix while keeping
 /// the column narrow; `json` always carries the untruncated value.
@@ -362,6 +368,7 @@ struct JsonLine<'a> {
     ts: String,
     level: &'static str,
     verbosity: &'static str,
+    component: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     dir: Option<&'static str>,
     #[serde(rename = "type")]
@@ -387,6 +394,7 @@ pub struct Event<'a> {
     cfg: DebugConfig,
     severity: Severity,
     dir: Direction,
+    component: &'static str,
     kind: &'a str,
     id: Option<&'a str>,
     peer: Option<&'a str>,
@@ -395,31 +403,31 @@ pub struct Event<'a> {
 }
 
 /// A frame this process is sending.
-pub fn outgoing(cfg: DebugConfig, kind: &str) -> Event<'_> {
-    Event::new(cfg, Severity::Debug, Direction::Out, kind)
+pub fn outgoing<'a>(cfg: DebugConfig, component: &'static str, kind: &'a str) -> Event<'a> {
+    Event::new(cfg, Severity::Debug, Direction::Out, component, kind)
 }
 
 /// A frame this process just received.
-pub fn incoming(cfg: DebugConfig, kind: &str) -> Event<'_> {
-    Event::new(cfg, Severity::Debug, Direction::In, kind)
+pub fn incoming<'a>(cfg: DebugConfig, component: &'static str, kind: &'a str) -> Event<'a> {
+    Event::new(cfg, Severity::Debug, Direction::In, component, kind)
 }
 
 /// A local lifecycle event, not a frame.
-pub fn local(cfg: DebugConfig, kind: &str) -> Event<'_> {
-    Event::new(cfg, Severity::Debug, Direction::Local, kind)
+pub fn local<'a>(cfg: DebugConfig, component: &'static str, kind: &'a str) -> Event<'a> {
+    Event::new(cfg, Severity::Debug, Direction::Local, component, kind)
 }
 
 /// An operational fact worth recording whether or not debug logging is
 /// on — always emitted, in whichever [`LogFormat`] is configured.
-pub fn info(cfg: DebugConfig, kind: &str) -> Event<'_> {
-    Event::new(cfg, Severity::Info, Direction::Local, kind)
+pub fn info<'a>(cfg: DebugConfig, component: &'static str, kind: &'a str) -> Event<'a> {
+    Event::new(cfg, Severity::Info, Direction::Local, component, kind)
 }
 
 /// Something went wrong that an operator would alert on — always emitted,
 /// in whichever [`LogFormat`] is configured. These are the lines that used
 /// to be bare `eprintln!` text and so were invisible to a log analyzer.
-pub fn warn(cfg: DebugConfig, kind: &str) -> Event<'_> {
-    Event::new(cfg, Severity::Warn, Direction::Local, kind)
+pub fn warn<'a>(cfg: DebugConfig, component: &'static str, kind: &'a str) -> Event<'a> {
+    Event::new(cfg, Severity::Warn, Direction::Local, component, kind)
 }
 
 impl<'a> Event<'a> {
@@ -434,11 +442,18 @@ impl<'a> Event<'a> {
         }
     }
 
-    fn new(cfg: DebugConfig, severity: Severity, dir: Direction, kind: &'a str) -> Self {
+    fn new(
+        cfg: DebugConfig,
+        severity: Severity,
+        dir: Direction,
+        component: &'static str,
+        kind: &'a str,
+    ) -> Self {
         Event {
             cfg,
             severity,
             dir,
+            component,
             kind,
             id: None,
             peer: None,
@@ -495,11 +510,13 @@ impl<'a> Event<'a> {
 
     fn render_text(&self) -> String {
         let mut line = format!(
-            "{} {} {} {:<width$}",
+            "{} {} {} {:<cwidth$} {:<width$}",
             emission_ts(),
             self.severity.as_text(),
             self.dir.as_text(),
+            self.component,
             self.kind,
+            cwidth = COMPONENT_COLUMN_WIDTH,
             width = TYPE_COLUMN_WIDTH,
         );
         if let Some(id) = self.id {
@@ -530,6 +547,7 @@ impl<'a> Event<'a> {
             ts: emission_ts(),
             level: self.severity.as_str(),
             verbosity: self.cfg.level.as_str(),
+            component: self.component,
             dir: self.dir.as_json(),
             kind: self.kind,
             id: self.id,
@@ -758,14 +776,25 @@ mod tests {
 
     #[test]
     fn text_line_starts_with_timestamp_then_fixed_columns() {
-        let line = outgoing(noisy_text(), "auth").id("abc123").render_text();
+        let line = outgoing(noisy_text(), "wire", "auth")
+            .id("abc123")
+            .render_text();
         assert_eq!(&line[26..27], "Z", "ts should occupy the first column");
-        assert!(line.contains(" DEBUG -> auth       "), "line was {line:?}");
+        assert!(
+            line.contains(&format!(
+                " DEBUG -> {:<cwidth$} {:<width$}",
+                "wire",
+                "auth",
+                cwidth = COMPONENT_COLUMN_WIDTH,
+                width = TYPE_COLUMN_WIDTH,
+            )),
+            "line was {line:?}"
+        );
     }
 
     #[test]
     fn json_line_is_a_single_parseable_object_with_ts_first() {
-        let line = incoming(noisy_json(), "hello")
+        let line = incoming(noisy_json(), "wire", "hello")
             .id("id-1")
             .peer("server")
             .render_json();
@@ -779,7 +808,7 @@ mod tests {
 
     #[test]
     fn json_nests_the_frame_as_an_object_not_a_string() {
-        let line = outgoing(noisy_json(), "auth")
+        let line = outgoing(noisy_json(), "wire", "auth")
             .frame(|| r#"{"v":1,"type":"auth"}"#.to_string())
             .render_json();
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -790,7 +819,9 @@ mod tests {
     #[test]
     fn json_carries_the_full_untruncated_id() {
         let long_id = "c14fb1a960b3d14d690e652e53b8b33a";
-        let line = outgoing(noisy_json(), "auth").id(long_id).render_json();
+        let line = outgoing(noisy_json(), "wire", "auth")
+            .id(long_id)
+            .render_json();
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(parsed["id"], long_id);
     }
@@ -798,7 +829,9 @@ mod tests {
     #[test]
     fn text_truncates_long_ids_for_scannability() {
         let long_id = "c14fb1a960b3d14d690e652e53b8b33a";
-        let line = outgoing(noisy_text(), "auth").id(long_id).render_text();
+        let line = outgoing(noisy_text(), "wire", "auth")
+            .id(long_id)
+            .render_text();
         assert!(line.contains("id=c14fb1a960b3"), "line was {line:?}");
         assert!(!line.contains(long_id));
     }
@@ -807,7 +840,7 @@ mod tests {
     fn quiet_never_materializes_the_frame() {
         let cfg = DebugConfig::new(DebugLevel::Quiet, LogFormat::Json);
         let mut called = false;
-        let line = outgoing(cfg, "auth")
+        let line = outgoing(cfg, "wire", "auth")
             .frame(|| {
                 called = true;
                 "{}".to_string()
@@ -823,7 +856,7 @@ mod tests {
     fn none_level_never_materializes_the_frame_either() {
         let cfg = DebugConfig::new(DebugLevel::None, LogFormat::Text);
         let mut called = false;
-        outgoing(cfg, "auth")
+        outgoing(cfg, "wire", "auth")
             .frame(|| {
                 called = true;
                 "{}".to_string()
@@ -835,7 +868,7 @@ mod tests {
 
     #[test]
     fn local_events_carry_no_direction() {
-        let line = local(noisy_json(), "connected")
+        let line = local(noisy_json(), "wire", "connected")
             .field("addr", "127.0.0.1:41807")
             .render_json();
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -848,7 +881,7 @@ mod tests {
     #[test]
     fn warn_is_emitted_even_at_debug_level_none() {
         let cfg = DebugConfig::new(DebugLevel::None, LogFormat::Json);
-        let event = warn(cfg, "conn").field("event", "dropped");
+        let event = warn(cfg, "wire", "conn").field("event", "dropped");
         assert!(
             event.will_emit(),
             "a warn must survive DebugLevel::None — these lines used to be \
@@ -859,15 +892,15 @@ mod tests {
     #[test]
     fn info_is_emitted_even_at_debug_level_none() {
         let cfg = DebugConfig::new(DebugLevel::None, LogFormat::Text);
-        assert!(info(cfg, "logging_started").will_emit());
+        assert!(info(cfg, "cli", "logging_started").will_emit());
     }
 
     #[test]
     fn debug_severity_is_still_gated_by_debug_level() {
         let none = DebugConfig::new(DebugLevel::None, LogFormat::Json);
-        assert!(!outgoing(none, "auth").will_emit());
+        assert!(!outgoing(none, "wire", "auth").will_emit());
         let quiet = DebugConfig::new(DebugLevel::Quiet, LogFormat::Json);
-        assert!(outgoing(quiet, "auth").will_emit());
+        assert!(outgoing(quiet, "wire", "auth").will_emit());
     }
 
     #[test]
@@ -876,7 +909,7 @@ mod tests {
         // does, so a warn below `DebugLevel::None` must not silently drop
         // the reason an operator needs.
         let cfg = DebugConfig::new(DebugLevel::None, LogFormat::Json);
-        let line = warn(cfg, "conn")
+        let line = warn(cfg, "wire", "conn")
             .field("event", "dropped")
             .field("reason", "connection closed by peer")
             .render_json();
@@ -891,10 +924,11 @@ mod tests {
     fn json_level_reflects_severity_not_a_constant() {
         let cfg = noisy_json();
         let d: serde_json::Value =
-            serde_json::from_str(&outgoing(cfg, "auth").render_json()).unwrap();
+            serde_json::from_str(&outgoing(cfg, "wire", "auth").render_json()).unwrap();
         let i: serde_json::Value =
-            serde_json::from_str(&info(cfg, "logging_started").render_json()).unwrap();
-        let w: serde_json::Value = serde_json::from_str(&warn(cfg, "conn").render_json()).unwrap();
+            serde_json::from_str(&info(cfg, "cli", "logging_started").render_json()).unwrap();
+        let w: serde_json::Value =
+            serde_json::from_str(&warn(cfg, "wire", "conn").render_json()).unwrap();
         assert_eq!(d["level"], "debug");
         assert_eq!(i["level"], "info");
         assert_eq!(w["level"], "warn");
@@ -906,26 +940,49 @@ mod tests {
         // columns after them still line up.
         let cfg = noisy_text();
         for line in [
-            outgoing(cfg, "auth").render_text(),
-            info(cfg, "logging_started").render_text(),
-            warn(cfg, "conn").render_text(),
+            outgoing(cfg, "wire", "auth").render_text(),
+            info(cfg, "cli", "logging_started").render_text(),
+            warn(cfg, "wire", "conn").render_text(),
         ] {
             assert_eq!(&line[27..28], " ", "line was {line:?}");
             assert_eq!(&line[33..34], " ", "severity column width, line {line:?}");
         }
     }
 
+    #[test]
+    fn text_line_has_component_column_before_kind() {
+        let line = outgoing(noisy_text(), "wire", "prompt").render_text();
+        let expected = format!(
+            "{:<cwidth$} {:<width$}",
+            "wire",
+            "prompt",
+            cwidth = COMPONENT_COLUMN_WIDTH,
+            width = TYPE_COLUMN_WIDTH,
+        );
+        assert!(
+            line.contains(&expected),
+            "expected padded component column before kind; line was {line:?}"
+        );
+    }
+
+    #[test]
+    fn json_line_carries_component_as_top_level_field() {
+        let line = outgoing(noisy_json(), "http_attach", "prompt").render_json();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["component"], "http_attach");
+    }
 
     #[test]
     fn flattened_fields_never_shadow_an_envelope_key() {
         // `fields` is `#[serde(flatten)]`ed into the same object as the
-        // envelope keys, so a field named `verbosity`/`ts`/`level`/`type`
-        // would emit a duplicate JSON key. Callers must not reuse these
-        // names; this pins the envelope key set that is off limits.
-        let line = info(noisy_json(), "logging_started")
+        // envelope keys, so a field named `verbosity`/`ts`/`level`/`type`/
+        // `component` would emit a duplicate JSON key. Callers must not
+        // reuse these names; this pins the envelope key set that is off
+        // limits.
+        let line = info(noisy_json(), "cli", "logging_started")
             .field("format", "json")
             .render_json();
-        for key in ["ts", "level", "verbosity", "type"] {
+        for key in ["ts", "level", "verbosity", "component", "type"] {
             let occurrences = line.matches(&format!("\"{key}\":")).count();
             assert_eq!(occurrences, 1, "duplicate {key:?} key in {line:?}");
         }
@@ -936,7 +993,7 @@ mod tests {
 
     #[test]
     fn extra_fields_are_flattened_not_nested() {
-        let line = outgoing(noisy_json(), "reply")
+        let line = outgoing(noisy_json(), "wire", "reply")
             .field("session", "m1")
             .render_json();
         let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();

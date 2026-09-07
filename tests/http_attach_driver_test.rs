@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use holler_client::acp_driver::DriverError;
 use holler_client::config::{SessionConfig, SessionMode, SessionRegistry};
+use holler_client::debug::DebugConfig;
 use holler_client::session_manager::SessionManager;
 
 /// A fake OpenCode HTTP control surface: answers the existence check,
@@ -134,7 +135,7 @@ async fn attach_then_manager_shutdown_leaves_attached_body_answering() {
         "ses_abc",
     )])
     .unwrap();
-    let manager = SessionManager::spawn(&registry, None)
+    let manager = SessionManager::spawn(&registry, None, DebugConfig::default())
         .await
         .expect("attach should succeed against a fake server that answers 200");
 
@@ -173,7 +174,7 @@ async fn simulated_cli_detach_leaves_attached_body_answering() {
         "ses_def",
     )])
     .unwrap();
-    let manager = SessionManager::spawn(&registry, None)
+    let manager = SessionManager::spawn(&registry, None, DebugConfig::default())
         .await
         .expect("attach should succeed");
 
@@ -201,7 +202,7 @@ async fn spawn_path_still_tears_down_its_own_child() {
         ..Default::default()
     };
     let registry = SessionRegistry::from_configs(vec![config]).unwrap();
-    let manager = SessionManager::spawn(&registry, None)
+    let manager = SessionManager::spawn(&registry, None, DebugConfig::default())
         .await
         .expect("spawn should still work exactly as before");
 
@@ -227,7 +228,7 @@ async fn attach_to_missing_session_fails_closed_before_any_write() {
     let config = attach_config("alpha", server.base_url(), "ses_does_not_exist");
     let registry = SessionRegistry::from_configs(vec![config]).unwrap();
 
-    match SessionManager::spawn(&registry, None).await {
+    match SessionManager::spawn(&registry, None, DebugConfig::default()).await {
         Err(holler_client::session_manager::ManagerError::Driver(
             DriverError::AttachSessionNotFound { .. },
         )) => {}
