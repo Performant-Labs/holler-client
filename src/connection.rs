@@ -1160,6 +1160,58 @@ mod tests {
         );
     }
 
+    /// hlrclnt-1702 (Diagnostics & Status Introspection): a run process
+    /// that heartbeated fine and then went quiet long ago (network died,
+    /// laptop slept, process hung) and a client that was simply never
+    /// launched both resolve to the exact same [`LiveState::Disconnected`]
+    /// -- `holler status` has no third state for "was alive, heartbeat is
+    /// long overdue" versus "no connection ever attempted, or cleanly
+    /// cleared". This pins that as the real, current, verified behavior
+    /// (not a hypothesis): a genuine diagnostic gap, tracked for a future
+    /// decision on whether a distinct "stalled" state is worth the
+    /// complexity, rather than something to redesign here.
+    #[test]
+    fn stalled_process_and_never_connected_are_indistinguishable() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // "Stalled": really was connected, but its last heartbeat is a
+        // full hour stale -- far past any reasonable `stale_after()`.
+        let stalled = ConnectionStateStore::at_dir(dir.path().join("stalled"));
+        std::fs::create_dir_all(dir.path().join("stalled")).unwrap();
+        let hour_ago = OffsetDateTime::now_utc().unix_timestamp() - 3600;
+        let persisted = PersistedLiveState {
+            state: "connected".to_string(),
+            updated_at: OffsetDateTime::from_unix_timestamp(hour_ago)
+                .unwrap()
+                .format(&Rfc3339)
+                .unwrap(),
+        };
+        std::fs::write(
+            dir.path().join("stalled").join(CONNECTION_STATE_FILE),
+            serde_json::to_string(&persisted).unwrap(),
+        )
+        .unwrap();
+
+        // "Never connected": no state file was ever written.
+        let never_connected = ConnectionStateStore::at_dir(dir.path().join("never"));
+
+        assert_eq!(
+            stalled.current_state(stale_after()),
+            LiveState::Disconnected
+        );
+        assert_eq!(
+            never_connected.current_state(stale_after()),
+            LiveState::Disconnected
+        );
+        assert_eq!(
+            stalled.current_state(stale_after()),
+            never_connected.current_state(stale_after()),
+            "a stalled (heartbeat long overdue) connection and one that never \
+             connected at all must currently be distinguishable only by this \
+             test failing -- LiveState itself carries no such variant"
+        );
+    }
+
     #[test]
     fn clear_removes_state_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
