@@ -311,7 +311,7 @@ impl std::error::Error for ConnectError {}
 /// probe result, by session *name* since several attach sessions can share
 /// one harness id — issue #102). The one filter `hello`'s `sessions` list
 /// and `presence`'s session rows both apply.
-fn confirmed_sessions<'a>(
+pub fn confirmed_sessions<'a>(
     registry: &'a SessionRegistry,
     confirmed_harnesses: &[String],
     confirmed_attach_sessions: &[String],
