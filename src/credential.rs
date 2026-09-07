@@ -152,12 +152,23 @@ impl CredentialStore {
 
     /// Persists a credential, overwriting any previous one (a re-join
     /// replaces the prior identity outright rather than merging with it).
+    ///
+    /// Hardened to `0600` on Unix (hlrclnt-1802) -- this file carries a
+    /// long-lived credential, the same sensitivity class as the server's
+    /// control socket (`0600`, `src/wire/control.rs::bind_control_socket`),
+    /// so it should never be group/world-readable regardless of the
+    /// process umask.
     pub fn save(&self, credential: &PersistedCredential) -> Result<(), CredentialError> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
         let contents = serde_json::to_string_pretty(credential)?;
         fs::write(&self.path, contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 
@@ -284,23 +295,22 @@ mod tests {
         assert!(!json.contains("hlr_join_"));
     }
 
-    /// hlrclnt-1802 (security/crypto group): pins CURRENT behavior, does
-    /// NOT assert the secure outcome. `save` writes via plain `fs::write`
-    /// with no explicit permission hardening, so the persisted long-lived
-    /// credential inherits the process umask -- world/group-readable under
-    /// a typical `022` umask, unlike holler-server's control socket
-    /// (`0600`, `src/wire/control.rs::bind_control_socket`). This is a
-    /// real, flagged security gap, not fixed here -- see the linked issue.
-    /// If this test ever fails because the mode is `0600`, the gap has
-    /// been fixed: flip this assertion (and the issue) to require it.
+    /// hlrclnt-1802 (security/crypto group): the persisted long-lived
+    /// credential file must be owner-only (`0600`), matching
+    /// holler-server's own control socket
+    /// (`src/wire/control.rs::bind_control_socket`). Fixed 2026-09-07 --
+    /// `save` previously wrote via plain `fs::write` with no explicit
+    /// permission hardening, so the file inherited the process umask
+    /// (world/group-readable under a typical `022` umask). The umask is
+    /// fixed for the duration of this test so the assertion is
+    /// deterministic regardless of the ambient environment's umask (CI and
+    /// local dev machines can differ) -- `0600` must hold even under a
+    /// permissive `022` umask, which is the whole point of hardening it.
     #[test]
     #[cfg(unix)]
-    fn credential_file_is_not_yet_hardened_to_owner_only_permissions() {
+    fn credential_file_is_hardened_to_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        // Fix the umask for the duration of this test so the assertion is
-        // deterministic regardless of the ambient environment's umask
-        // (CI and local dev machines can differ).
         let prev_umask = unsafe { libc::umask(0o022) };
         let dir = tempfile::tempdir().unwrap();
         let store = CredentialStore::at_path(dir.path().join("credential.json"));
@@ -309,9 +319,8 @@ mod tests {
 
         let mode = fs::metadata(&store.path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            mode, 0o644,
-            "expected today's un-hardened 0o644 under umask 022; got {mode:o} -- \
-             if this is now 0o600 the gap has been fixed, update this test"
+            mode, 0o600,
+            "credential file must be owner-only regardless of umask; got {mode:o}"
         );
     }
 }
