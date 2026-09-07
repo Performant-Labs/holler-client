@@ -309,25 +309,33 @@ fn run_run(config: Option<&std::path::Path>, cfg: DebugConfig) -> Result<(), Str
     result.map_err(|e| e.to_string())
 }
 
-/// Spawns a [`SessionManager`] for every session whose harness is
-/// confirmed runnable right now — the same set `hello`/`presence`
-/// advertise (issue #49). Never fails `run_run` itself: a hung or
-/// non-ACP-conformant harness (confirmed only means "an executable file
-/// is on `PATH`", not "speaks ACP") just means this invocation connects
-/// without live sessions, answering `prompt`/`interrupt` for any of them
-/// with `unknown_session` — the same as an unconfigured session, not a
-/// reason to refuse the WebSocket connection itself.
+/// Spawns a [`SessionManager`] for every session confirmed live right now —
+/// the exact same set `hello`/`presence` advertise (issue #49), using the
+/// same mode-aware confirmation [`connection::confirmed_sessions`] does: a
+/// spawn session via `confirmed_harnesses` (an executable file on `PATH`,
+/// not "speaks ACP"), an attach session via a real HTTP probe of its
+/// configured endpoint/session id. Attach sessions always carry an empty
+/// `command` (never used, never a spawn fallback), so `confirmed_harnesses`
+/// alone can never confirm one — using it as the sole filter here silently
+/// dropped every attach session's real driver while `presence` still
+/// advertised it as live, making `say`/`interrupt` fail with
+/// `unknown_session` against a session the roster showed as connected.
+/// Never fails `run_run` itself: a session that isn't confirmed just means
+/// this invocation connects without it live, answering `prompt`/`interrupt`
+/// for it with `unknown_session` — the same as an unconfigured session, not
+/// a reason to refuse the WebSocket connection itself.
 async fn spawn_session_manager(
     registry: &SessionRegistry,
     cfg: DebugConfig,
 ) -> Option<SessionManager> {
-    let confirmed = registry.confirmed_harnesses();
-    let live_sessions: Vec<_> = registry
-        .sessions()
-        .iter()
-        .filter(|s| confirmed.contains(&s.harness))
-        .cloned()
-        .collect();
+    let confirmed_harnesses = registry.confirmed_harnesses();
+    let confirmed_attach =
+        holler_client::http_attach_driver::confirmed_attach_sessions(registry).await;
+    let live_sessions: Vec<_> =
+        connection::confirmed_sessions(registry, &confirmed_harnesses, &confirmed_attach)
+            .into_iter()
+            .cloned()
+            .collect();
     if live_sessions.is_empty() {
         return None;
     }
