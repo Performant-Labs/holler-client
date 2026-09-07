@@ -1,11 +1,16 @@
-//! Session runtime (issues #27, #28): owns one live [`AcpDriver`] per
-//! configured session and gives it the two behaviors a future
-//! network-facing story (#24) needs to expose over the wire:
+//! Session runtime (issues #27, #28, #100): owns one live `SessionDriver`
+//! per configured session -- an [`AcpDriver`] (spawn mode) or an
+//! [`crate::http_attach_driver::HttpAttachDriver`] (attach mode), selected
+//! by [`crate::config::SessionConfig::mode`] -- and gives it the two
+//! behaviors a future network-facing story (#24) needs to expose over the
+//! wire:
 //!
-//! - **Interrupt mapping** (#27): [`SessionManager::interrupt`] sends ACP
-//!   `session/cancel`. If the ACP connection can no longer carry that
-//!   notification, it falls back to `POST {base_url}/api/session/{id}/interrupt`
-//!   against the agent's own HTTP control surface.
+//! - **Interrupt mapping** (#27, #100): for a spawn session,
+//!   [`SessionManager::interrupt`] sends ACP `session/cancel`, falling back
+//!   to `POST {base_url}/api/session/{id}/interrupt` only if the ACP
+//!   connection can no longer carry that notification. For an attach
+//!   session there is no ACP channel at all, so the same HTTP interrupt is
+//!   used directly and unconditionally as the *primary* path.
 //! - **Busy-turn policy** (#28): [`SessionManager::prompt`] queues a prompt
 //!   sent while a turn is already in flight, and drains the queue (one at a
 //!   time) as turns complete. `interrupt` only cancels the current turn —
@@ -42,7 +47,58 @@ use std::collections::{HashMap, VecDeque};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::acp_driver::{AcpDriver, DriverError, DriverEvent};
-use crate::config::SessionRegistry;
+use crate::config::{SessionConfig, SessionMode, SessionRegistry};
+use crate::http_attach_driver::HttpAttachDriver;
+
+/// Wraps whichever transport a session's `mode` selects (issue #100,
+/// ADR-0005), so [`run_session`]'s prompt/interrupt/busy-queue loop stays
+/// a single implementation instead of forking per transport. Both variants
+/// expose the same shape as [`AcpDriver`] itself
+/// (`prompt`/`next_event`/`shutdown`).
+enum SessionDriver {
+    /// `mode = "spawn"` / omitted: this process owns the ACP child.
+    Acp(AcpDriver),
+    /// `mode = "attach"`: an already-running OpenCode, driven over HTTP.
+    /// Never the parent of the process it talks to.
+    Http(HttpAttachDriver),
+}
+
+impl SessionDriver {
+    async fn for_config(config: &SessionConfig) -> Result<Self, DriverError> {
+        match config.mode {
+            SessionMode::Spawn => AcpDriver::spawn(config).await.map(SessionDriver::Acp),
+            SessionMode::Attach => {
+                HttpAttachDriver::attach(config).await.map(SessionDriver::Http)
+            }
+        }
+    }
+
+    fn prompt(&self, text: impl Into<String>) -> Result<(), DriverError> {
+        match self {
+            SessionDriver::Acp(d) => d.prompt(text),
+            SessionDriver::Http(d) => d.prompt(text),
+        }
+    }
+
+    async fn next_event(&mut self) -> Option<DriverEvent> {
+        match self {
+            SessionDriver::Acp(d) => d.next_event().await,
+            SessionDriver::Http(d) => d.next_event().await,
+        }
+    }
+
+    /// Transport-aware teardown (issue #101). `Acp` keeps today's child
+    /// teardown (waits for the spawned ACP subprocess). `Http` drops its
+    /// own event-listener task only -- no HTTP delete, no process kill (it
+    /// owns no process), no `session/new` replacement. The attached
+    /// OpenCode session is completely untouched.
+    async fn shutdown(self) -> Result<(), DriverError> {
+        match self {
+            SessionDriver::Acp(d) => d.shutdown().await,
+            SessionDriver::Http(d) => d.shutdown().await,
+        }
+    }
+}
 
 /// Errors from a [`SessionManager`] operation.
 #[derive(Debug)]
@@ -148,7 +204,9 @@ impl SessionManager {
     ) -> Result<Self, ManagerError> {
         let mut handles = HashMap::with_capacity(registry.sessions().len());
         for config in registry.sessions() {
-            let driver = AcpDriver::spawn(config).await.map_err(ManagerError::Driver)?;
+            let driver = SessionDriver::for_config(config)
+                .await
+                .map_err(ManagerError::Driver)?;
             let (command_tx, command_rx) = mpsc::unbounded_channel();
             let (event_tx, event_rx) = mpsc::unbounded_channel();
             let http = http_fallback_base_url
@@ -278,7 +336,7 @@ impl SessionManager {
 /// [`SessionManager`] was dropped or [`SessionManager::shutdown`] was
 /// called) or the driven [`AcpDriver`]'s connection ends.
 async fn run_session(
-    mut driver: AcpDriver,
+    mut driver: SessionDriver,
     http: Option<(reqwest::Client, String)>,
     mut command_rx: mpsc::UnboundedReceiver<ManagerCommand>,
     event_tx: mpsc::UnboundedSender<DriverEvent>,
@@ -369,29 +427,42 @@ async fn run_session(
     let _ = driver.shutdown().await;
 }
 
-/// Sends ACP `session/cancel`; falls back to the HTTP interrupt endpoint
-/// only when that notification could not be delivered at all. See the
-/// module docs for why that is the trigger this module uses.
+/// For an ACP-spawned session: sends `session/cancel`, falling back to the
+/// HTTP interrupt endpoint only when that notification could not be
+/// delivered at all (see the module docs for why that's this module's
+/// chosen trigger). For an attach session there is no ACP channel at
+/// all -- HTTP interrupt is used directly and unconditionally, as the
+/// *primary* path (issue #100), never a fallback reached after a fake ACP
+/// disconnect.
 async fn attempt_cancel(
-    driver: &AcpDriver,
+    driver: &SessionDriver,
     http: Option<(&reqwest::Client, &str)>,
 ) -> Result<CancelChannel, ManagerError> {
-    match driver.cancel() {
-        Ok(()) => Ok(CancelChannel::Acp),
-        Err(DriverError::Disconnected) => {
-            let (client, base_url) = http.ok_or(ManagerError::Disconnected)?;
-            let url = format!(
-                "{}/api/session/{}/interrupt",
-                base_url.trim_end_matches('/'),
-                driver.session_id()
-            );
-            client
-                .post(url)
-                .send()
+    match driver {
+        SessionDriver::Acp(acp) => match acp.cancel() {
+            Ok(()) => Ok(CancelChannel::Acp),
+            Err(DriverError::Disconnected) => {
+                let (client, base_url) = http.ok_or(ManagerError::Disconnected)?;
+                let url = format!(
+                    "{}/api/session/{}/interrupt",
+                    base_url.trim_end_matches('/'),
+                    acp.session_id()
+                );
+                client
+                    .post(url)
+                    .send()
+                    .await
+                    .map_err(|err| ManagerError::Http(err.to_string()))?;
+                Ok(CancelChannel::Http)
+            }
+            Err(other) => Err(ManagerError::Driver(other)),
+        },
+        SessionDriver::Http(http_driver) => {
+            http_driver
+                .interrupt()
                 .await
-                .map_err(|err| ManagerError::Http(err.to_string()))?;
+                .map_err(ManagerError::Driver)?;
             Ok(CancelChannel::Http)
         }
-        Err(other) => Err(ManagerError::Driver(other)),
     }
 }

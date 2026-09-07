@@ -19,9 +19,12 @@ path = "src/main.rs"
 
 [dependencies]
 agent-client-protocol = "2.1.0"
-# HTTP interrupt fallback (issue #27) targets a plain-HTTP local agent
-# control endpoint, never HTTPS, so no TLS backend is enabled here.
-reqwest = { version = "0.12", default-features = false }
+# HTTP interrupt fallback (issue #27) and the attach-mode HTTP driver
+# (issue #100) both target a plain-HTTP local agent control endpoint,
+# never HTTPS, so no TLS backend is enabled here. `json` is for the
+# prompt/existence-check request bodies; `stream` is for reading the
+# attach driver's SSE event feed (`Response::bytes_stream`).
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 # CLI parsing for the `holler` binary (issue #23), same justification as
 # the server's #29 CLI: hand-rolled arg parsing doesn't scale past a
 # couple of flags, and this is the de facto standard crate for it.

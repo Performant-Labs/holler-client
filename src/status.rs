@@ -132,12 +132,14 @@ mod tests {
                 harness: "opencode".to_string(),
                 command: vec!["opencode".to_string(), "acp".to_string()],
                 interrupt: None,
+                ..Default::default()
             },
             SessionConfig {
                 name: "testhost-beta".to_string(),
                 harness: "opencode".to_string(),
                 command: vec!["opencode".to_string(), "acp".to_string()],
                 interrupt: None,
+                ..Default::default()
             },
         ])
         .unwrap()

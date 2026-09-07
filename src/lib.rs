@@ -8,6 +8,7 @@ pub mod config;
 pub mod connection;
 pub mod credential;
 pub mod debug;
+pub mod http_attach_driver;
 pub mod instance_lock;
 pub mod join;
 pub mod proto;

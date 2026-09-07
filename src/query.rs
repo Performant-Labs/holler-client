@@ -263,6 +263,7 @@ mod tests {
             harness: "opencode".to_string(),
             command: vec!["/bin/sh".to_string()],
             interrupt: None,
+            ..Default::default()
         }])
         .unwrap()
     }

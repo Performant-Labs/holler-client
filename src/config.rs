@@ -27,18 +27,65 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+/// Which transport a session uses to reach its harness (issue #99, ADR-0005
+/// / holler-server ADR-0017).
+///
+/// `Spawn` is the v1 default: this process owns and execs `command`.
+/// `Attach` is additive: an already-running OpenCode (typically inside a
+/// Herdr pane on the same box) is driven over its own HTTP control surface
+/// instead — this process is never its parent, never execs anything for
+/// it, and never calls `session/new` against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionMode {
+    #[default]
+    Spawn,
+    Attach,
+}
+
 /// Configuration for a single local session.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+///
+/// `command` is required when `mode` is `Spawn` (the default) and ignored
+/// when `mode` is `Attach` (never used as a spawn fallback). `endpoint` /
+/// `session_id` are required when `mode` is `Attach` and unused otherwise.
+/// [`SessionRegistry::from_configs`] enforces this per-mode requirement;
+/// this struct's own field types stay permissive (`Option`/default-empty)
+/// so a mixed registry (one spawn session + one attach session) can
+/// round-trip through TOML at all — the real validation is deliberately a
+/// separate, explicit step (see `validate_mode_fields`) rather than baked
+/// into `serde`'s required-field checking the way `command` alone used to
+/// be, since which fields are required now depends on `mode`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct SessionConfig {
     pub name: String,
     pub harness: String,
+    #[serde(default)]
+    pub mode: SessionMode,
+    #[serde(default)]
     pub command: Vec<String>,
     /// Optional interrupt signal/command for the session's harness process.
     /// Modeled as a single string (e.g. a signal name like `"SIGINT"`)
     /// rather than argv, since an interrupt is a single control action, not
-    /// a program invocation.
+    /// a program invocation. Spawn-mode only; meaningless for attach.
     #[serde(default)]
     pub interrupt: Option<String>,
+    /// Attach mode only: the base URL of the already-running OpenCode's own
+    /// HTTP control surface (e.g. `http://127.0.0.1:4096`).
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Attach mode only: the OpenCode session id (`ses_...`) to attach to.
+    /// Required — attach never mints a new session (`session/new` /
+    /// `POST /session`) on the operator's behalf; a missing id is a
+    /// fail-closed config error, not a cue to create one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+impl SessionConfig {
+    /// Whether this is an attach-mode session.
+    pub fn is_attach(&self) -> bool {
+        self.mode == SessionMode::Attach
+    }
 }
 
 /// Top-level shape of the TOML config file: a `[[session]]` array of tables.
@@ -59,6 +106,18 @@ pub enum ConfigError {
     /// rather than silently deduplicating, since a silent drop would hide
     /// a session the caller expected to exist.
     DuplicateSessionName(String),
+    /// A `mode = "spawn"` (or omitted) session has an empty `command` —
+    /// there is no program to spawn (issue #99: today's existing rule,
+    /// now enforced explicitly rather than via `serde`'s required-field
+    /// checking, since `command` had to become optional at the struct
+    /// level to let attach sessions omit it).
+    SpawnMissingCommand(String),
+    /// A `mode = "attach"` session has an empty/missing `endpoint`.
+    AttachMissingEndpoint(String),
+    /// A `mode = "attach"` session has an empty/missing `session_id`. Fail
+    /// closed here rather than minting a new OpenCode session on the
+    /// operator's behalf — attach never calls `session/new`.
+    AttachMissingSessionId(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -69,6 +128,19 @@ impl fmt::Display for ConfigError {
             ConfigError::DuplicateSessionName(name) => {
                 write!(f, "duplicate session name in config: {name}")
             }
+            ConfigError::SpawnMissingCommand(name) => {
+                write!(f, "session '{name}': mode=spawn requires a non-empty command")
+            }
+            ConfigError::AttachMissingEndpoint(name) => {
+                write!(f, "session '{name}': mode=attach requires a non-empty endpoint")
+            }
+            ConfigError::AttachMissingSessionId(name) => {
+                write!(
+                    f,
+                    "session '{name}': mode=attach requires a non-empty session_id \
+                     (attach never mints a new OpenCode session on your behalf)"
+                )
+            }
         }
     }
 }
@@ -78,9 +150,40 @@ impl std::error::Error for ConfigError {
         match self {
             ConfigError::Io(e) => Some(e),
             ConfigError::Parse(e) => Some(e),
-            ConfigError::DuplicateSessionName(_) => None,
+            ConfigError::DuplicateSessionName(_)
+            | ConfigError::SpawnMissingCommand(_)
+            | ConfigError::AttachMissingEndpoint(_)
+            | ConfigError::AttachMissingSessionId(_) => None,
         }
     }
+}
+
+/// Enforces the per-`mode` required fields (issue #99). Split out from
+/// [`SessionRegistry::from_configs`] so it's independently testable and so
+/// the duplicate-name check and the per-mode field check each report their
+/// own precise error rather than one being masked by the other.
+fn validate_mode_fields(session: &SessionConfig) -> Result<(), ConfigError> {
+    match session.mode {
+        SessionMode::Spawn => {
+            if session.command.is_empty() {
+                return Err(ConfigError::SpawnMissingCommand(session.name.clone()));
+            }
+        }
+        SessionMode::Attach => {
+            let endpoint_ok = session.endpoint.as_deref().is_some_and(|s| !s.is_empty());
+            if !endpoint_ok {
+                return Err(ConfigError::AttachMissingEndpoint(session.name.clone()));
+            }
+            let session_id_ok = session
+                .session_id
+                .as_deref()
+                .is_some_and(|s| !s.is_empty());
+            if !session_id_ok {
+                return Err(ConfigError::AttachMissingSessionId(session.name.clone()));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// In-memory registry of a process's local sessions.
@@ -98,6 +201,7 @@ impl SessionRegistry {
             if !seen.insert(session.name.clone()) {
                 return Err(ConfigError::DuplicateSessionName(session.name.clone()));
             }
+            validate_mode_fields(session)?;
         }
         Ok(SessionRegistry { sessions })
     }
@@ -264,6 +368,7 @@ mod tests {
                 harness: "opencode".to_string(),
                 command: vec!["opencode".to_string(), "acp".to_string()],
                 interrupt: None,
+                ..Default::default()
             })
         );
         assert_eq!(
@@ -273,6 +378,7 @@ mod tests {
                 harness: "stub-acp".to_string(),
                 command: vec!["tests/stub-acp".to_string()],
                 interrupt: Some("SIGINT".to_string()),
+                ..Default::default()
             })
         );
     }
@@ -368,12 +474,14 @@ mod tests {
                 harness: "opencode".to_string(),
                 command: vec!["/bin/sh".to_string()],
                 interrupt: None,
+                ..Default::default()
             },
             SessionConfig {
                 name: "b".to_string(),
                 harness: "claude".to_string(),
                 command: vec!["/no/such/binary".to_string()],
                 interrupt: None,
+                ..Default::default()
             },
         ])
         .unwrap();
@@ -387,6 +495,7 @@ mod tests {
             harness: "opencode".to_string(),
             command: vec!["/bin/sh".to_string(), "-c".to_string()],
             interrupt: None,
+            ..Default::default()
         }])
         .unwrap();
         assert_eq!(
@@ -404,16 +513,202 @@ mod tests {
                 harness: "opencode".to_string(),
                 command: vec!["opencode".to_string(), "acp".to_string()],
                 interrupt: None,
+                ..Default::default()
             },
             SessionConfig {
                 name: "two".to_string(),
                 harness: "opencode".to_string(),
                 command: vec!["opencode".to_string(), "acp".to_string()],
                 interrupt: None,
+                ..Default::default()
             },
         ];
         let registry = SessionRegistry::from_configs(sessions).unwrap();
 
         assert_eq!(registry.session_names(), vec!["one", "two"]);
+    }
+
+    // --- Attach mode (issue #99) ---------------------------------------
+
+    #[test]
+    fn attach_config_parses_from_toml() {
+        let toml_str = r#"
+            [[session]]
+            name = "alpha"
+            harness = "opencode"
+            mode = "attach"
+            endpoint = "http://127.0.0.1:4096"
+            session_id = "ses_abc123"
+        "#;
+
+        let registry = load_from_str(toml_str).expect("valid attach config should parse");
+        let session = registry.get("alpha").expect("session present");
+        assert!(session.is_attach());
+        assert_eq!(session.endpoint.as_deref(), Some("http://127.0.0.1:4096"));
+        assert_eq!(session.session_id.as_deref(), Some("ses_abc123"));
+        assert!(session.command.is_empty());
+    }
+
+    #[test]
+    fn attach_missing_endpoint_fails_closed() {
+        let toml_str = r#"
+            [[session]]
+            name = "alpha"
+            harness = "opencode"
+            mode = "attach"
+            session_id = "ses_abc123"
+        "#;
+
+        let err = load_from_str(toml_str).expect_err("missing endpoint must fail closed");
+        match err {
+            ConfigError::AttachMissingEndpoint(name) => assert_eq!(name, "alpha"),
+            other => panic!("expected AttachMissingEndpoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_empty_endpoint_fails_closed() {
+        let toml_str = r#"
+            [[session]]
+            name = "alpha"
+            harness = "opencode"
+            mode = "attach"
+            endpoint = ""
+            session_id = "ses_abc123"
+        "#;
+
+        let err = load_from_str(toml_str).expect_err("empty endpoint must fail closed");
+        assert!(matches!(err, ConfigError::AttachMissingEndpoint(_)));
+    }
+
+    #[test]
+    fn attach_missing_session_id_fails_closed() {
+        let toml_str = r#"
+            [[session]]
+            name = "alpha"
+            harness = "opencode"
+            mode = "attach"
+            endpoint = "http://127.0.0.1:4096"
+        "#;
+
+        let err = load_from_str(toml_str).expect_err("missing session_id must fail closed");
+        match err {
+            ConfigError::AttachMissingSessionId(name) => assert_eq!(name, "alpha"),
+            other => panic!("expected AttachMissingSessionId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_with_command_present_is_fine_but_ignored() {
+        // `command` must never be required for attach, but it also must not
+        // be an error if present (e.g. a config edited from a spawn entry) —
+        // it's simply ignored, never used as a spawn fallback.
+        let toml_str = r#"
+            [[session]]
+            name = "alpha"
+            harness = "opencode"
+            mode = "attach"
+            command = ["opencode", "acp"]
+            endpoint = "http://127.0.0.1:4096"
+            session_id = "ses_abc123"
+        "#;
+
+        let registry = load_from_str(toml_str).expect("command present must not error");
+        assert!(registry.get("alpha").unwrap().is_attach());
+    }
+
+    #[test]
+    fn spawn_missing_command_fails_closed() {
+        // Explicit regression check: `command` becoming `Option`-shaped at
+        // the struct level (to let attach configs omit it) must not weaken
+        // this existing rule for spawn mode.
+        let toml_str = r#"
+            [[session]]
+            name = "alpha"
+            harness = "opencode"
+        "#;
+
+        let err = load_from_str(toml_str).expect_err("spawn with no command must fail closed");
+        match err {
+            ConfigError::SpawnMissingCommand(name) => assert_eq!(name, "alpha"),
+            other => panic!("expected SpawnMissingCommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_mode_spawn_still_requires_command() {
+        let toml_str = r#"
+            [[session]]
+            name = "alpha"
+            harness = "opencode"
+            mode = "spawn"
+        "#;
+
+        let err = load_from_str(toml_str).expect_err("explicit spawn with no command must fail");
+        assert!(matches!(err, ConfigError::SpawnMissingCommand(_)));
+    }
+
+    #[test]
+    fn mixed_spawn_and_attach_registry_is_allowed() {
+        let toml_str = r#"
+            [[session]]
+            name = "alpha"
+            harness = "opencode"
+            command = ["opencode", "acp"]
+
+            [[session]]
+            name = "beta"
+            harness = "opencode"
+            mode = "attach"
+            endpoint = "http://127.0.0.1:4096"
+            session_id = "ses_xyz"
+        "#;
+
+        let registry = load_from_str(toml_str).expect("mixed registry should parse");
+        assert!(!registry.get("alpha").unwrap().is_attach());
+        assert!(registry.get("beta").unwrap().is_attach());
+        assert_eq!(registry.session_names(), vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn duplicate_names_rejected_even_across_mode_types() {
+        let toml_str = r#"
+            [[session]]
+            name = "alpha"
+            harness = "opencode"
+            command = ["opencode", "acp"]
+
+            [[session]]
+            name = "alpha"
+            harness = "opencode"
+            mode = "attach"
+            endpoint = "http://127.0.0.1:4096"
+            session_id = "ses_xyz"
+        "#;
+
+        let err = load_from_str(toml_str).expect_err("duplicate name must fail closed");
+        assert!(matches!(err, ConfigError::DuplicateSessionName(_)));
+    }
+
+    #[test]
+    fn attach_session_is_never_confirmed_by_path_lookup() {
+        // Attach sessions have an empty `command`, so today's PATH-based
+        // `command_is_runnable` correctly (if incidentally) already treats
+        // them as unconfirmed -- confirmation-by-HTTP-probe is story
+        // #100/#102's job, not this one's. This test pins that this story
+        // does not accidentally "fix" that by lying that attach is
+        // confirmed just because e.g. `/bin/sh` happens to be on PATH.
+        let registry = SessionRegistry::from_configs(vec![SessionConfig {
+            name: "alpha".to_string(),
+            harness: "opencode".to_string(),
+            mode: SessionMode::Attach,
+            endpoint: Some("http://127.0.0.1:4096".to_string()),
+            session_id: Some("ses_abc".to_string()),
+            ..Default::default()
+        }])
+        .unwrap();
+
+        assert!(registry.confirmed_harnesses().is_empty());
+        assert_eq!(registry.confirmed_command_for_harness("opencode"), None);
     }
 }
