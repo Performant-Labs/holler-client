@@ -39,6 +39,13 @@ but the process is identical. This page only covers what's specific to holler-cl
   or CLI-invocation changes from this release. Explicit call-out here on purpose: this step lives
   in holler-server's step-by-step (linked below), and a reader of only this page could otherwise
   miss that it applies here as well.
+- **Running the test catalog (`scripts/test-run.rb`) is done from `holler-server`, not here** —
+  the script only exists in that repo, even for `hlrclnt-*` cases. Another explicit call-out for
+  the same reason as the README one above: easy to miss if you're only looking at this page.
+- **Building for a platform you don't have locally** (e.g. Linux, from a Mac): see
+  holler-server's `docs/releasing.md` "Building for a platform you don't have locally" section —
+  the recipe (SSH to a real machine of that OS, clone at the exact tag, build, verify, scp back)
+  is identical here, just substitute this repo's clone URL and `holler` as the binary name.
 
 Everything else — version bump rules, tag format (`vX.Y.Z`, signed/annotated), `CHANGELOG.md`
 conventions, the two-tier "tag+CHANGELOG always, GitHub Release with binaries as a confirmed
