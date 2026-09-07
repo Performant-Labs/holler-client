@@ -349,3 +349,81 @@ async fn status_reports_mode_and_harness_session_id_for_attach_only() {
         "spawn session must not carry a harness_session_id key at all: {beta:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #131: an interrupt mid-tool-call must not permanently wedge the
+// session's local busy/queue state.
+// ---------------------------------------------------------------------------
+
+use holler_client::session_manager::{CancelChannel, InterruptOutcome, INTERRUPT_STALL_TIMEOUT};
+
+/// Reproduces the exact sequence reported live against real OpenCode:
+/// prompt (turn starts), interrupt while it's still "in flight" from this
+/// driver's point of view, then a second prompt for the same session --
+/// with the fake OpenCode never emitting a `session.idle` for the
+/// interrupted turn at all (this fixture's `/event` stream never sends
+/// anything, on purpose, standing in for OpenCode's real behavior of
+/// leaving a genuinely-cancelled tool-call message without ever reaching a
+/// terminal state). Before the fix, `SessionManager`'s local `busy` flag
+/// never cleared without that event, so the second prompt sat in the
+/// queue forever and this test would hang instead of completing.
+#[tokio::test]
+async fn interrupt_of_a_turn_with_no_terminal_event_unwedges_the_queue_after_the_stall_timeout() {
+    let server = FakeOpenCode::start(true);
+    let registry = SessionRegistry::from_configs(vec![attach_config(
+        "alpha",
+        server.base_url(),
+        "ses_stall",
+    )])
+    .unwrap();
+    let manager = SessionManager::spawn(&registry, None, DebugConfig::default())
+        .await
+        .expect("attach should succeed against a fake server that answers 200");
+
+    manager
+        .prompt("alpha", "start a tool call")
+        .expect("first prompt should send");
+    assert!(
+        manager.is_busy("alpha").await.unwrap(),
+        "busy must flip true once the first prompt is dispatched"
+    );
+
+    let outcome = manager
+        .interrupt("alpha")
+        .await
+        .expect("interrupt should be acked (HTTP 204) even though the turn never completes");
+    assert_eq!(outcome, InterruptOutcome::Cancelled(CancelChannel::Http));
+
+    // Right after the ack, nothing has cleared `busy` yet -- the fake
+    // server's `/event` stream never sends a `session.idle`, so only the
+    // stall timeout (not yet elapsed) will do that.
+    assert!(
+        manager.is_busy("alpha").await.unwrap(),
+        "busy must still be true immediately after the ack -- only the stall timeout clears it here"
+    );
+
+    // Reported hang: this second prompt for the same session, sent while
+    // `busy` is (spuriously, from this fixture's PoV) still true, must not
+    // be dropped -- it queues, then the stall timeout must drain it.
+    manager
+        .prompt("alpha", "are you back?")
+        .expect("second prompt must still be accepted, not rejected");
+
+    tokio::time::sleep(INTERRUPT_STALL_TIMEOUT + std::time::Duration::from_millis(500)).await;
+
+    let prompt_dispatches = server
+        .recorded_requests()
+        .iter()
+        .filter(|r| r.starts_with("POST /session/") && r.contains("/prompt_async"))
+        .count();
+    assert_eq!(
+        prompt_dispatches, 2,
+        "both the first and the queued second prompt must reach OpenCode -- the second must not stay wedged forever"
+    );
+    assert!(
+        manager.is_busy("alpha").await.unwrap(),
+        "the queued prompt was dispatched as its own turn, so busy must be true again"
+    );
+
+    manager.shutdown().await;
+}

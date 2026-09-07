@@ -43,13 +43,32 @@
 //! unsupported" from the issue text — ACP v1 has no such signal to read.
 
 use std::collections::{HashMap, VecDeque};
+use std::pin::Pin;
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Sleep;
 
 use crate::acp_driver::{AcpDriver, DriverError, DriverEvent};
 use crate::config::{SessionConfig, SessionMode, SessionRegistry};
 use crate::debug::{self, DebugConfig};
 use crate::http_attach_driver::HttpAttachDriver;
+
+/// How long [`run_session`] waits, after an interrupt has been
+/// successfully acked while a turn was in flight, for that turn's
+/// [`DriverEvent::StopReason`] to actually arrive before giving up on it
+/// and forcibly clearing local `busy`/queue state itself (issue #131).
+///
+/// A well-behaved agent reports a cancelled turn's completion quickly, so
+/// this is generous, not a tight race. It exists for the case a real
+/// interrupt mid-tool-call was observed to trigger: OpenCode's HTTP
+/// interrupt endpoint acks (204) unconditionally, but a genuinely
+/// cancelled turn's assistant message can be left without ever reaching a
+/// terminal state on OpenCode's side, so no `session.idle` (and therefore
+/// no `StopReason`) is ever emitted for it. Without this timeout, `busy`
+/// would then never clear and every later prompt for that session would
+/// queue forever with zero signal back to the caller.
+pub const INTERRUPT_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Wraps whichever transport a session's `mode` selects (issue #100,
 /// ADR-0005), so [`run_session`]'s prompt/interrupt/busy-queue loop stays
@@ -354,6 +373,12 @@ async fn run_session(
     // observes `driver.cancel()` failing once this happens) and silently
     // drops further `Prompt`s (nothing left to deliver them to).
     let mut driver_alive = true;
+    // Armed the moment an interrupt is successfully acked while `busy`;
+    // disarmed as soon as either the interrupted turn's real `StopReason`
+    // arrives or this deadline itself fires. See `INTERRUPT_STALL_TIMEOUT`'s
+    // docs (issue #131) for why the ack alone cannot be trusted to mean the
+    // turn is over, and why this can't just wait unboundedly for the event.
+    let mut interrupt_deadline: Option<Pin<Box<Sleep>>> = None;
 
     loop {
         if driver_alive {
@@ -373,9 +398,17 @@ async fn run_session(
                         Some(ManagerCommand::Interrupt(reply_tx)) => {
                             let result = if busy {
                                 let http_ref = http.as_ref().map(|(client, url)| (client, url.as_str()));
-                                attempt_cancel(&driver, http_ref, cfg)
+                                let outcome = attempt_cancel(&driver, http_ref, cfg)
                                     .await
-                                    .map(InterruptOutcome::Cancelled)
+                                    .map(InterruptOutcome::Cancelled);
+                                if outcome.is_ok() {
+                                    debug::local(cfg, "session_manager", "interrupt")
+                                        .field("event", "stall_timeout_armed")
+                                        .emit();
+                                    interrupt_deadline =
+                                        Some(Box::pin(tokio::time::sleep(INTERRUPT_STALL_TIMEOUT)));
+                                }
+                                outcome
                             } else {
                                 Ok(InterruptOutcome::NoTurnInFlight)
                             };
@@ -393,6 +426,7 @@ async fn run_session(
                             let turn_ended = matches!(driver_event, DriverEvent::StopReason(_));
                             let _ = event_tx.send(driver_event);
                             if turn_ended {
+                                interrupt_deadline = None;
                                 busy = false;
                                 if let Some(next_text) = queue.pop_front() {
                                     if driver.prompt(next_text).is_ok() {
@@ -402,6 +436,29 @@ async fn run_session(
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+                _ = async {
+                    match interrupt_deadline.as_mut() {
+                        Some(deadline) => deadline.await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if interrupt_deadline.is_some() => {
+                    // The interrupted turn never reported completion --
+                    // treat the earlier ack as authoritative rather than
+                    // leaving this session's queue wedged forever waiting
+                    // for a `StopReason` that may never arrive (issue #131).
+                    debug::warn(cfg, "session_manager", "interrupt")
+                        .field("event", "stall_timeout_forced_clear")
+                        .emit();
+                    interrupt_deadline = None;
+                    busy = false;
+                    if let Some(next_text) = queue.pop_front() {
+                        if driver.prompt(next_text).is_ok() {
+                            busy = true;
+                        } else {
+                            driver_alive = false;
                         }
                     }
                 }
