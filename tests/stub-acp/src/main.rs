@@ -47,7 +47,10 @@
 //!   assertions can compare against an exact constant. It then
 //!   responds to the request with `{"stopReason": "end_turn"}`, or
 //!   `{"stopReason": "cancelled"}` if a `session/cancel` is still
-//!   pending for this session (see below).
+//!   pending for this session (see below). `--pause-after-chunk N`
+//!   (default: none) sleeps `PAUSE_DURATION` after the Nth chunk of each
+//!   turn, before continuing — a deterministic window for a test to act
+//!   partway through a streamed turn.
 //! - `session/cancel` params: `{"sessionId": ...}`. May arrive as a
 //!   request (has `id`, gets a `{"sessionId": ..., "cancelled": true}`
 //!   response) or as a notification (no `id`, no response). Since
@@ -99,6 +102,18 @@ fn main() {
         .unwrap_or(1)
         .max(1);
 
+    // `--pause-after-chunk N` (default: none): after emitting the Nth
+    // `agent_message_chunk` update of a turn (1-indexed), sleep for
+    // `PAUSE_DURATION` before emitting the rest + the final response.
+    // Added for holler-server#98's hlrclnt-1618 (mid-turn network blip):
+    // gives a test a wide, deterministic window to drop the WS connection
+    // strictly between two DriverEvent batches, rather than racing the
+    // (sub-millisecond) real local-IPC timing of an unpaused turn.
+    let pause_after_chunk = std::env::args()
+        .skip_while(|a| a != "--pause-after-chunk")
+        .nth(1)
+        .and_then(|n| n.parse::<usize>().ok());
+
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     let mut sessions: HashMap<String, Session> = HashMap::new();
@@ -117,15 +132,29 @@ fn main() {
                 continue;
             }
         };
-        handle_message(&msg, &mut sessions, &mut stdout, chunks_per_turn);
+        handle_message(
+            &msg,
+            &mut sessions,
+            &mut stdout,
+            chunks_per_turn,
+            pause_after_chunk,
+        );
     }
 }
+
+/// How long a `--pause-after-chunk` pause lasts. Comfortably wider than
+/// the reply coalescer's 50ms debounce window (`DEFAULT_WINDOW`,
+/// `src/reply_coalescer.rs`) and any realistic local-IPC/TCP-RST latency,
+/// so a test reacting to the pre-pause chunks has a wide, non-racy margin
+/// to act in before the post-pause ones are even generated.
+const PAUSE_DURATION: std::time::Duration = std::time::Duration::from_millis(500);
 
 fn handle_message(
     msg: &Value,
     sessions: &mut HashMap<String, Session>,
     out: &mut impl Write,
     chunks_per_turn: usize,
+    pause_after_chunk: Option<usize>,
 ) {
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let request_id = msg.get("id").filter(|v| !v.is_null()).cloned();
@@ -169,7 +198,7 @@ fn handle_message(
                 .map(|s| std::mem::take(&mut s.cancel_pending))
                 .unwrap_or(false);
 
-            for _ in 0..chunks_per_turn {
+            for i in 1..=chunks_per_turn {
                 notify(
                     out,
                     "session/update",
@@ -181,6 +210,9 @@ fn handle_message(
                         },
                     }),
                 );
+                if pause_after_chunk == Some(i) {
+                    std::thread::sleep(PAUSE_DURATION);
+                }
             }
 
             let stop_reason = if cancelled { "cancelled" } else { "end_turn" };
