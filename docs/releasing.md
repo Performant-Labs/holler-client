@@ -39,6 +39,7 @@ but the process is identical. This page only covers what's specific to holler-cl
 Everything else — version bump rules, tag format (`vX.Y.Z`, signed/annotated), `CHANGELOG.md`
 conventions, the two-tier "tag+CHANGELOG always, GitHub Release with binaries as a confirmed
 extra" shape, and the step-by-step sequence — is exactly as documented in holler-server's page
-linked above. For the actual checklist to run through each time, see this repo's pinned
-release-checklist issue — [#119](https://github.com/Performant-Labs/holler-client/issues/119) for
-the first release; a fresh one gets filed per release going forward.
+linked above. For the actual checklist to run through each time, copy
+[#119](https://github.com/Performant-Labs/holler-client/issues/119) — the reusable, versionless
+template — into a new issue titled `Release checklist: vX.Y.Z`, and fill in that copy. Don't
+check boxes on #119 itself.
