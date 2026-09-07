@@ -10,12 +10,27 @@ pre-decision history.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-07
+
 ### Enhancements
 
 - Attach mode detects a real OpenCode `question`/permission gate blocking a session's
   turn (polling `GET /question`/`GET /permission`) and answers it via the new
   `holler-server answer <session> <choice>` wire path (issue #133) — surfaced as
-  `DriverStatus::Blocked`.
+  `DriverStatus::Blocked`. Verified live end-to-end against a real `opencode serve`
+  instance: a real `question` tool call was detected, answered, and the turn resumed
+  correctly.
+
+### Known Issues
+
+- Spawn-mode (ACP) sessions cannot answer a question/permission yet — only attach-mode
+  sessions can (`DriverError::AnswerUnsupported`). ACP's `session/request_permission`
+  needs inbound-RPC plumbing the driver doesn't have.
+- Multi-question requests (more than one question per single request) aren't answerable
+  via a single `choice` argument.
+- The `Blocked` status isn't yet surfaced in `presence`/`roster`/`status` documents — the
+  detect-and-reply mechanism works, but an operator watching `roster` alone can't yet see
+  that a session is blocked on a question versus just busy.
 
 ## [0.1.0] - 2026-09-07
 
