@@ -283,4 +283,35 @@ mod tests {
         assert!(!json.contains("\"secret\""));
         assert!(!json.contains("hlr_join_"));
     }
+
+    /// hlrclnt-1802 (security/crypto group): pins CURRENT behavior, does
+    /// NOT assert the secure outcome. `save` writes via plain `fs::write`
+    /// with no explicit permission hardening, so the persisted long-lived
+    /// credential inherits the process umask -- world/group-readable under
+    /// a typical `022` umask, unlike holler-server's control socket
+    /// (`0600`, `src/wire/control.rs::bind_control_socket`). This is a
+    /// real, flagged security gap, not fixed here -- see the linked issue.
+    /// If this test ever fails because the mode is `0600`, the gap has
+    /// been fixed: flip this assertion (and the issue) to require it.
+    #[test]
+    #[cfg(unix)]
+    fn credential_file_is_not_yet_hardened_to_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Fix the umask for the duration of this test so the assertion is
+        // deterministic regardless of the ambient environment's umask
+        // (CI and local dev machines can differ).
+        let prev_umask = unsafe { libc::umask(0o022) };
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::at_path(dir.path().join("credential.json"));
+        store.save(&sample()).unwrap();
+        unsafe { libc::umask(prev_umask) };
+
+        let mode = fs::metadata(&store.path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "expected today's un-hardened 0o644 under umask 022; got {mode:o} -- \
+             if this is now 0o600 the gap has been fixed, update this test"
+        );
+    }
 }
