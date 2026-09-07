@@ -246,3 +246,105 @@ async fn attach_to_missing_session_fails_closed_before_any_write() {
         "the one request sent must be the existence check, not a write: {requests:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #102: support/caps/status for attach.
+// ---------------------------------------------------------------------------
+
+use holler_client::connection::LiveState;
+use holler_client::proto::QueryBody;
+use holler_client::query;
+
+fn dispatch_local(cmd: &str, registry: &SessionRegistry, confirmed_attach: &[String]) -> serde_json::Value {
+    let query = QueryBody { cmd: cmd.to_string(), args: vec![] };
+    query::dispatch(&query, 1, None, registry, "kiwi", LiveState::Disconnected, confirmed_attach)
+        .expect("dispatch should not fail for a known cmd")
+}
+
+fn dispatch_support(feature: &str, registry: &SessionRegistry, confirmed_attach: &[String]) -> serde_json::Value {
+    let query = QueryBody { cmd: "support".to_string(), args: vec![feature.to_string()] };
+    query::dispatch(&query, 1, None, registry, "kiwi", LiveState::Disconnected, confirmed_attach)
+        .expect("support <feature> should not fail for a known feature")
+}
+
+/// `holler support attach` is a static capability, `true` unconditionally
+/// once this binary implements attach mode -- not gated on any session
+/// being configured, still less on one being reachable.
+#[tokio::test]
+async fn support_attach_is_always_true_regardless_of_configuration() {
+    let empty = SessionRegistry::from_configs(vec![]).unwrap();
+    let query = QueryBody { cmd: "support".to_string(), args: vec!["attach".to_string()] };
+    let body = query::dispatch(&query, 1, None, &empty, "kiwi", LiveState::Disconnected, &[])
+        .expect("support attach must be answerable");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["kind"], "capability");
+}
+
+/// `holler support opencode-http` is `true` iff at least one configured
+/// attach session's real HTTP endpoint answers right now, `false` (with a
+/// clear reason, not a bare `false`) when none do -- confirmed via a real
+/// fake HTTP OpenCode double, not a hardcoded assumption.
+#[tokio::test]
+async fn support_opencode_http_reflects_a_real_probe_not_a_static_flag() {
+    let live_server = FakeOpenCode::start(true);
+    let live_config = attach_config("alpha", live_server.base_url(), "ses_real");
+    let live_registry = SessionRegistry::from_configs(vec![live_config]).unwrap();
+    let confirmed = holler_client::http_attach_driver::confirmed_attach_sessions(&live_registry).await;
+    assert_eq!(confirmed, vec!["alpha".to_string()], "a real, answering endpoint must be confirmed");
+    let body = dispatch_support("opencode-http", &live_registry, &confirmed);
+    assert_eq!(body["ok"], true, "endpoint answers, opencode-http support must be true");
+
+    let dead_server = FakeOpenCode::start(false); // every existence check 404s
+    let dead_config = attach_config("beta", dead_server.base_url(), "ses_missing");
+    let dead_registry = SessionRegistry::from_configs(vec![dead_config]).unwrap();
+    let confirmed = holler_client::http_attach_driver::confirmed_attach_sessions(&dead_registry).await;
+    assert!(confirmed.is_empty(), "a 404ing endpoint must not be confirmed");
+    let body = dispatch_support("opencode-http", &dead_registry, &confirmed);
+    assert_eq!(body["ok"], false, "no reachable attach session, opencode-http support must be false");
+    assert!(body["reason"].is_string(), "a false answer must carry a reason, not just `false`");
+}
+
+/// `status`'s per-session shape: an attach session reports `mode: "attach"`
+/// and its real `harness_session_id`; a spawn session reports neither key
+/// at all (not `null`, genuinely absent) -- ADR-0017's "optional presence
+/// keys, unknown keys ignored" contract, and attach is only "confirmed" (so
+/// only appears at all) once its real endpoint answers.
+#[tokio::test]
+async fn status_reports_mode_and_harness_session_id_for_attach_only() {
+    let server = FakeOpenCode::start(true);
+    let attach_cfg = attach_config("alpha", server.base_url(), "ses_abc123");
+    let spawn_cfg = SessionConfig {
+        name: "beta".to_string(),
+        harness: "opencode".to_string(),
+        command: vec!["/bin/sh".to_string()],
+        ..Default::default()
+    };
+    let registry = SessionRegistry::from_configs(vec![attach_cfg, spawn_cfg]).unwrap();
+    let confirmed_attach = holler_client::http_attach_driver::confirmed_attach_sessions(&registry).await;
+    assert_eq!(confirmed_attach, vec!["alpha".to_string()]);
+
+    let body = dispatch_local("status", &registry, &confirmed_attach);
+    let sessions = body["sessions"].as_array().expect("sessions is an array");
+
+    let alpha = sessions
+        .iter()
+        .find(|s| s["name"] == "alpha")
+        .expect("attach session alpha (confirmed via the real probe) must be present");
+    assert_eq!(alpha["mode"], "attach");
+    assert_eq!(alpha["harness_session_id"], "ses_abc123");
+
+    // `/bin/sh` is a real, always-present absolute path, so `beta` (spawn)
+    // is confirmed runnable via the existing PATH check and appears too --
+    // its shape must have neither key at all (not `null`), the actual
+    // point of this test: attach and spawn sessions are genuinely
+    // distinguishable in the same document, and spawn's shape is untouched.
+    let beta = sessions
+        .iter()
+        .find(|s| s["name"] == "beta")
+        .expect("spawn session beta (confirmed runnable via PATH) must be present");
+    assert!(beta.get("mode").is_none(), "spawn session must not carry a mode key at all: {beta:?}");
+    assert!(
+        beta.get("harness_session_id").is_none(),
+        "spawn session must not carry a harness_session_id key at all: {beta:?}"
+    );
+}

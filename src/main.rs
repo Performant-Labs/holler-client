@@ -358,6 +358,17 @@ fn run_query_local(
         .map(|s| s.current_state(connection::stale_after()))
         .unwrap_or(LiveState::Disconnected);
 
+    // Attach confirmation (issue #102) needs a real HTTP probe per
+    // configured attach session, which can't happen inside `query::dispatch`
+    // itself (it stays a synchronous, pure function of its arguments) — this
+    // CLI entrypoint is otherwise fully synchronous, so a small throwaway
+    // runtime does just this one async step before falling back to the
+    // existing sync path. A registry with zero attach sessions costs nothing
+    // here: the probe loop simply never iterates.
+    let confirmed_attach = tokio::runtime::Runtime::new()
+        .map_err(|e| e.to_string())?
+        .block_on(holler_client::http_attach_driver::confirmed_attach_sessions(&registry));
+
     let query = QueryBody {
         cmd: cmd.to_string(),
         args: args.to_vec(),
@@ -369,6 +380,7 @@ fn run_query_local(
         &registry,
         &hostname,
         live,
+        &confirmed_attach,
     )
     .map_err(|e| e.to_string())?;
 

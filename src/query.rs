@@ -43,6 +43,21 @@ pub const CLIENT_FEATURES: &[&str] = &["ping", "query", "interrupt", "presence"]
 pub const KNOWN_PROTOCOL_FEATURES: &[&str] =
     &["interrupt", "presence", "ping", "query", "roster", "token", "wait"];
 
+/// Client-specific capability ids (issue #102, ADR-0005) — not part of the
+/// wire spec's protocol-feature vocabulary, and not a harness name either,
+/// so they get their own `kind` (`"capability"`) rather than being forced
+/// into `answer_support`'s existing feature/harness split:
+///
+/// - `attach`: does this binary implement attach mode at all? A static
+///   capability of the binary (true since issue #100 shipped), not a
+///   per-session probe.
+/// - `opencode-http`: is at least one *configured* attach session's
+///   `endpoint` answering for its `session_id`, right now? A real HTTP
+///   probe result (`crate::http_attach_driver::confirmed_attach_sessions`),
+///   passed in by the caller — this module stays a pure function of its
+///   arguments, same as everything else here.
+pub const KNOWN_CAPABILITY_IDS: &[&str] = &["attach", "opencode-http"];
+
 /// The v1 harness id vocabulary (spec §9). "Unknown ids are legal" per that
 /// section — this list is only used to build `caps`'s full map, not to
 /// reject a `support` query about an id outside it.
@@ -100,7 +115,7 @@ struct SupportAnswer {
 /// ([`SessionRegistry::confirmed_command_for_harness`]). An id outside
 /// both vocabularies is treated as an (unconfigured) harness id — spec §9:
 /// "Unknown ids are legal."
-fn answer_support(id: &str, registry: &SessionRegistry) -> SupportAnswer {
+fn answer_support(id: &str, registry: &SessionRegistry, confirmed_attach_sessions: &[String]) -> SupportAnswer {
     if KNOWN_PROTOCOL_FEATURES.contains(&id) {
         let ok = CLIENT_FEATURES.contains(&id);
         return SupportAnswer {
@@ -108,6 +123,25 @@ fn answer_support(id: &str, registry: &SessionRegistry) -> SupportAnswer {
             kind: "feature",
             how: None,
             reason: if ok { None } else { Some("not implemented".to_string()) },
+        };
+    }
+    if id == "attach" {
+        // Static: this binary has implemented attach mode since issue #100,
+        // regardless of whether any attach session is currently configured
+        // or reachable — "can you do this at all," not "is one working now."
+        return SupportAnswer { ok: true, kind: "capability", how: None, reason: None };
+    }
+    if id == "opencode-http" {
+        let ok = !confirmed_attach_sessions.is_empty();
+        return SupportAnswer {
+            ok,
+            kind: "capability",
+            how: None,
+            reason: if ok {
+                None
+            } else {
+                Some("no configured attach session's endpoint is answering".to_string())
+            },
         };
     }
     match registry.confirmed_command_for_harness(id) {
@@ -148,10 +182,19 @@ fn status_value(
     registry: &SessionRegistry,
     hostname: &str,
     live: LiveState,
+    confirmed_attach_sessions: &[String],
 ) -> Value {
     let confirmed = registry.confirmed_harnesses();
     let features: Vec<String> = CLIENT_FEATURES.iter().map(|s| s.to_string()).collect();
-    let doc = status::build(client_id, registry, hostname.to_string(), live, &confirmed, features);
+    let doc = status::build(
+        client_id,
+        registry,
+        hostname.to_string(),
+        live,
+        &confirmed,
+        confirmed_attach_sessions,
+        features,
+    );
     serde_json::to_value(doc).expect("ClientStatus always serializes")
 }
 
@@ -166,13 +209,18 @@ fn caps_value(
     registry: &SessionRegistry,
     hostname: &str,
     live: LiveState,
+    confirmed_attach_sessions: &[String],
 ) -> Value {
-    let mut body = status_value(client_id, registry, hostname, live);
+    let mut body = status_value(client_id, registry, hostname, live, confirmed_attach_sessions);
     body["cmd"] = json!("caps");
 
     let mut capabilities = serde_json::Map::new();
-    for id in KNOWN_PROTOCOL_FEATURES.iter().chain(KNOWN_HARNESS_IDS.iter()) {
-        let answer = answer_support(id, registry);
+    for id in KNOWN_PROTOCOL_FEATURES
+        .iter()
+        .chain(KNOWN_HARNESS_IDS.iter())
+        .chain(KNOWN_CAPABILITY_IDS.iter())
+    {
+        let answer = answer_support(id, registry, confirmed_attach_sessions);
         let mut entry = json!({ "ok": answer.ok, "kind": answer.kind });
         if let Some(how) = &answer.how {
             entry["how"] = json!(how);
@@ -232,13 +280,17 @@ pub fn dispatch(
     registry: &SessionRegistry,
     hostname: &str,
     live: LiveState,
+    confirmed_attach_sessions: &[String],
 ) -> Result<Value, QueryError> {
     match query.cmd.as_str() {
-        "status" => Ok(status_value(client_id, registry, hostname, live)),
-        "caps" => Ok(caps_value(client_id, registry, hostname, live)),
+        "status" => Ok(status_value(client_id, registry, hostname, live, confirmed_attach_sessions)),
+        "caps" => Ok(caps_value(client_id, registry, hostname, live, confirmed_attach_sessions)),
         "support" => {
             let feature = query.args.first().ok_or(QueryError::UnknownFeature)?;
-            Ok(support_value(feature, &answer_support(feature, registry)))
+            Ok(support_value(
+                feature,
+                &answer_support(feature, registry, confirmed_attach_sessions),
+            ))
         }
         "protocol" => protocol_value(&query.args, session_v),
         _ => Err(QueryError::UnknownCmd),
@@ -271,7 +323,7 @@ mod tests {
     #[test]
     fn support_known_implemented_feature_is_ok() {
         let query = QueryBody { cmd: "support".to_string(), args: vec!["ping".to_string()] };
-        let body = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected).unwrap();
+        let body = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected, &[]).unwrap();
         assert_eq!(body["ok"], true);
         assert_eq!(body["kind"], "feature");
         assert_eq!(body["feature"], "ping");
@@ -280,7 +332,7 @@ mod tests {
     #[test]
     fn support_known_unimplemented_feature_is_not_ok() {
         let query = QueryBody { cmd: "support".to_string(), args: vec!["roster".to_string()] };
-        let body = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected).unwrap();
+        let body = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected, &[]).unwrap();
         assert_eq!(body["ok"], false);
         assert_eq!(body["kind"], "feature");
         assert_eq!(body["reason"], "not implemented");
@@ -289,7 +341,7 @@ mod tests {
     #[test]
     fn support_unconfigured_harness_is_not_ok() {
         let query = QueryBody { cmd: "support".to_string(), args: vec!["claude".to_string()] };
-        let body = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected).unwrap();
+        let body = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected, &[]).unwrap();
         assert_eq!(body["ok"], false);
         assert_eq!(body["kind"], "harness");
         assert_eq!(body["reason"], "no adapter");
@@ -298,7 +350,7 @@ mod tests {
     #[test]
     fn support_confirmed_runnable_harness_is_ok_with_how() {
         let query = QueryBody { cmd: "support".to_string(), args: vec!["opencode".to_string()] };
-        let body = dispatch(&query, 1, None, &runnable_registry(), "kiwi", LiveState::Disconnected).unwrap();
+        let body = dispatch(&query, 1, None, &runnable_registry(), "kiwi", LiveState::Disconnected, &[]).unwrap();
         assert_eq!(body["ok"], true);
         assert_eq!(body["kind"], "harness");
         assert_eq!(body["how"], "/bin/sh");
@@ -307,7 +359,7 @@ mod tests {
     #[test]
     fn support_with_no_args_is_unknown_feature() {
         let query = QueryBody { cmd: "support".to_string(), args: vec![] };
-        let err = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected).unwrap_err();
+        let err = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected, &[]).unwrap_err();
         assert_eq!(err, QueryError::UnknownFeature);
         assert_eq!(err.code(), "unknown_feature");
     }
@@ -315,7 +367,7 @@ mod tests {
     #[test]
     fn status_reports_role_client_and_confirmed_harnesses() {
         let query = QueryBody { cmd: "status".to_string(), args: vec![] };
-        let body = dispatch(&query, 1, Some("cli_1"), &runnable_registry(), "kiwi", LiveState::Connected).unwrap();
+        let body = dispatch(&query, 1, Some("cli_1"), &runnable_registry(), "kiwi", LiveState::Connected, &[]).unwrap();
         assert_eq!(body["cmd"], "status");
         assert_eq!(body["role"], "client");
         assert_eq!(body["connected"], true);
@@ -326,7 +378,7 @@ mod tests {
     #[test]
     fn caps_includes_every_known_id_in_capabilities_map() {
         let query = QueryBody { cmd: "caps".to_string(), args: vec![] };
-        let body = dispatch(&query, 1, None, &runnable_registry(), "kiwi", LiveState::Disconnected).unwrap();
+        let body = dispatch(&query, 1, None, &runnable_registry(), "kiwi", LiveState::Disconnected, &[]).unwrap();
         assert_eq!(body["cmd"], "caps");
         for id in KNOWN_PROTOCOL_FEATURES.iter().chain(KNOWN_HARNESS_IDS.iter()) {
             assert!(body["capabilities"].get(id).is_some(), "missing capability entry for {id}");
@@ -339,7 +391,7 @@ mod tests {
     #[test]
     fn protocol_with_no_args_reports_min_max_and_session() {
         let query = QueryBody { cmd: "protocol".to_string(), args: vec![] };
-        let body = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected).unwrap();
+        let body = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected, &[]).unwrap();
         assert_eq!(body["cmd"], "protocol");
         assert_eq!(body["session"], 1);
         assert_eq!(body["min"], 1);
@@ -351,7 +403,7 @@ mod tests {
     #[test]
     fn protocol_asking_supported_version_is_ok() {
         let query = QueryBody { cmd: "protocol".to_string(), args: vec!["1".to_string()] };
-        let body = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected).unwrap();
+        let body = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected, &[]).unwrap();
         assert_eq!(body["ok"], true);
         assert_eq!(body["asked"], 1);
     }
@@ -359,7 +411,7 @@ mod tests {
     #[test]
     fn protocol_asking_unsupported_version_is_not_ok_but_not_an_error() {
         let query = QueryBody { cmd: "protocol".to_string(), args: vec!["2".to_string()] };
-        let body = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected).unwrap();
+        let body = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected, &[]).unwrap();
         assert_eq!(body["ok"], false);
         assert_eq!(body["asked"], 2);
     }
@@ -367,21 +419,21 @@ mod tests {
     #[test]
     fn protocol_non_integer_arg_is_unknown_feature() {
         let query = QueryBody { cmd: "protocol".to_string(), args: vec!["not-a-number".to_string()] };
-        let err = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected).unwrap_err();
+        let err = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected, &[]).unwrap_err();
         assert_eq!(err, QueryError::UnknownFeature);
     }
 
     #[test]
     fn protocol_zero_is_not_a_positive_integer() {
         let query = QueryBody { cmd: "protocol".to_string(), args: vec!["0".to_string()] };
-        let err = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected).unwrap_err();
+        let err = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected, &[]).unwrap_err();
         assert_eq!(err, QueryError::UnknownFeature);
     }
 
     #[test]
     fn unknown_cmd_fails_closed() {
         let query = QueryBody { cmd: "summarize".to_string(), args: vec![] };
-        let err = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected).unwrap_err();
+        let err = dispatch(&query, 1, None, &empty_registry(), "kiwi", LiveState::Disconnected, &[]).unwrap_err();
         assert_eq!(err, QueryError::UnknownCmd);
         assert_eq!(err.code(), "unknown_cmd");
     }

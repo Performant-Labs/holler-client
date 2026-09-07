@@ -38,6 +38,19 @@ pub struct SessionStatus {
     /// Always `false` today: this story tracks no live driver state.
     /// Real busy/idle tracking arrives with the live session work (#24+).
     pub busy: bool,
+    /// `"attach"` for an attach-mode session, omitted (not `"spawn"`) for a
+    /// spawn session — issue #102, ADR-0017's "optional presence keys;
+    /// unknown keys ignored; no protocol version bump" rule. Omitted rather
+    /// than always-present-with-a-default so an old server/decoder that has
+    /// never heard of attach mode sees exactly the same shape it always has
+    /// for every session it already understands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<&'static str>,
+    /// The OpenCode `ses_…` id this session is attached to — locator/display
+    /// only (ADR-0017 §4: routing stays by Holler session *name*, never by
+    /// this id). Omitted for spawn sessions, which have no such id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -71,23 +84,38 @@ pub struct ClientStatus {
 /// document is still well-formed, just without a `client_id`. `live` is
 /// this invocation's read of [`crate::connection::ConnectionStateStore`]
 /// — this process has no socket of its own to ask directly. `harnesses`
-/// and `sessions` are filtered to `confirmed_harnesses` — see module docs.
+/// and `sessions` are filtered to `confirmed_harnesses` for spawn sessions
+/// (a PATH/executable check) and `confirmed_attach_sessions` for attach
+/// sessions (a real HTTP probe result, by session *name* since several
+/// attach sessions can share one harness id) — issue #102: attach is never
+/// confirmed by PATH-checking `opencode`, so it needs its own list, gathered
+/// by the caller (an async HTTP probe has no business happening inside this
+/// otherwise-pure function — see `crate::http_attach_driver::confirmed_attach_sessions`).
 pub fn build(
     client_id: Option<&str>,
     registry: &SessionRegistry,
     hostname: String,
     live: LiveState,
     confirmed_harnesses: &[String],
+    confirmed_attach_sessions: &[String],
     features: Vec<String>,
 ) -> ClientStatus {
     let sessions = registry
         .sessions()
         .iter()
-        .filter(|s| confirmed_harnesses.iter().any(|h| h == &s.harness))
+        .filter(|s| {
+            if s.is_attach() {
+                confirmed_attach_sessions.iter().any(|n| n == &s.name)
+            } else {
+                confirmed_harnesses.iter().any(|h| h == &s.harness)
+            }
+        })
         .map(|s| SessionStatus {
             name: s.name.clone(),
             harness: s.harness.clone(),
             busy: false,
+            mode: if s.is_attach() { Some("attach") } else { None },
+            harness_session_id: if s.is_attach() { s.session_id.clone() } else { None },
         })
         .collect();
 
@@ -157,6 +185,7 @@ mod tests {
             "kiwi".to_string(),
             LiveState::Disconnected,
             &confirmed_opencode(),
+            &[],
             features(),
         );
         assert_eq!(status.client_id, None);
@@ -176,6 +205,7 @@ mod tests {
             "kiwi".to_string(),
             LiveState::Disconnected,
             &confirmed_opencode(),
+            &[],
             features(),
         );
         assert_eq!(status.client_id.as_deref(), Some("cli_abc123"));
@@ -189,6 +219,7 @@ mod tests {
             "kiwi".to_string(),
             LiveState::Disconnected,
             &confirmed_opencode(),
+            &[],
             features(),
         );
         assert_eq!(status.harnesses, vec!["opencode"]);
@@ -208,6 +239,7 @@ mod tests {
             "kiwi".to_string(),
             LiveState::Disconnected,
             &[], // nothing confirmed runnable
+            &[],
             features(),
         );
         assert!(status.harnesses.is_empty());
@@ -222,6 +254,7 @@ mod tests {
             "kiwi".to_string(),
             LiveState::Connected,
             &confirmed_opencode(),
+            &[],
             features(),
         );
         assert!(status.connected);
@@ -236,6 +269,7 @@ mod tests {
             "kiwi".to_string(),
             LiveState::Connecting,
             &confirmed_opencode(),
+            &[],
             features(),
         );
         assert!(!status.connected);
@@ -250,6 +284,7 @@ mod tests {
             "kiwi".to_string(),
             LiveState::Reconnecting,
             &confirmed_opencode(),
+            &[],
             features(),
         );
         assert!(!status.connected);
