@@ -235,6 +235,65 @@ async fn join_then_status_then_detach_then_status() {
     assert!(!status_stdout2.contains("client_id"));
 }
 
+/// hlrclnt-1803 (Security & Encryption group): ADR-0003's guarantee --
+/// "the secret is not valid as WebSocket session auth after redeem" and
+/// is never stored -- checked as its own, narrowly-scoped case (the
+/// broader `join_then_status_then_detach_then_status` above already
+/// exercises this inline, but that test's real purpose is the
+/// join/status/detach lifecycle; this one exists so the property has a
+/// single, precisely-titled home in the catalog). After a real `join`,
+/// the raw one-time secret must be absent from `credential.json`'s on-disk
+/// bytes AND from every query surface (`status`, `caps`, `query caps`) --
+/// `PersistedCredential` (src/credential.rs) has no field for it at all,
+/// so this is really proving the negative holds end-to-end, not just at
+/// the struct definition.
+#[tokio::test]
+async fn raw_join_secret_never_appears_in_persisted_or_queried_state() {
+    let env = Env::new();
+    let secret = "hlr_join_secrecytesttoken";
+    let token = format!("tok_secrecy:{secret}");
+
+    let (listener, url) = bind_local().await;
+    let child = env.spawn_join(&url, &token);
+
+    let mut ws = accept_ws(&listener).await;
+    let (from, body) = expect_join(&mut ws).await;
+    assert_eq!(from, "tok_secrecy");
+    assert_eq!(body.secret, secret);
+
+    let reply = join_ok_envelope("ignored", "cli_secrecytest", "hlr_live_secrecytestcred");
+    send_envelope(&mut ws, &reply).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), ws.next()).await;
+
+    let join_out = finish_join(child);
+    assert!(join_out.status.success(), "{join_out:?}");
+
+    // On disk: PersistedCredential (src/credential.rs) has no field for
+    // the raw one-time secret at all -- confirm that's true of the real
+    // bytes written, not just the struct definition.
+    let credential_contents =
+        std::fs::read_to_string(env.dir.path().join("credential.json")).unwrap();
+    assert!(
+        !credential_contents.contains(secret),
+        "raw join secret must never be persisted"
+    );
+    assert!(
+        !credential_contents.contains(&token),
+        "the full <token_id>:<secret> string must never be persisted either"
+    );
+
+    // Every query surface: status, caps, and a general `query caps`.
+    for args in [vec!["status"], vec!["caps"], vec!["query", "caps"]] {
+        let out = env.cmd().args(&args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            !stdout.contains(secret),
+            "{args:?} must never echo the raw join secret, got: {stdout}"
+        );
+    }
+}
+
 #[test]
 fn detach_without_join_is_not_an_error() {
     let env = Env::new();
