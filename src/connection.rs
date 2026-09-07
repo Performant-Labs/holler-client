@@ -72,14 +72,14 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::acp_driver::{DriverEvent, DriverStatus};
+use crate::acp_driver::{DriverError, DriverEvent, DriverStatus};
 use crate::config::{SessionConfig, SessionRegistry};
 use crate::credential::{resolve_state_dir, CredentialError, STATE_DIR_ENV};
 use crate::debug::{self, DebugConfig};
 use crate::http_attach_driver;
 use crate::proto::{
-    self, Body, ErrorBody, InterruptBody, PromptBody, CODE_SESSION_UNAVAILABLE,
-    CODE_UNAUTHENTICATED, CODE_UNKNOWN_SESSION,
+    self, AnswerBody, Body, ErrorBody, InterruptBody, PromptBody, CODE_NO_PENDING_ANSWER,
+    CODE_SESSION_UNAVAILABLE, CODE_UNAUTHENTICATED, CODE_UNKNOWN_SESSION,
 };
 use crate::query;
 use crate::reply_coalescer::ReplyCoalescer;
@@ -807,6 +807,54 @@ async fn session_loop(
                                     .emit();
                                 if ws.send(Message::Text(raw.into())).await.is_err() {
                                     return LoopExit::Dropped("failed to send interrupt reply".to_string());
+                                }
+                            }
+                            Body::Answer(AnswerBody { session, choice }) => {
+                                let reply = match session_manager {
+                                    Some(manager) => match manager.answer(&session, choice).await {
+                                        Ok(()) => proto::ack_reply(&envelope.id, client_id),
+                                        Err(ManagerError::UnknownSession(_)) => proto::error_reply(
+                                            &envelope.id,
+                                            client_id,
+                                            CODE_UNKNOWN_SESSION,
+                                            None,
+                                            &format!("no such session: {session}"),
+                                        ),
+                                        Err(err @ ManagerError::Driver(
+                                            DriverError::NoPendingAnswer(_)
+                                            | DriverError::AnswerUnsupported,
+                                        )) => proto::error_reply(
+                                            &envelope.id,
+                                            client_id,
+                                            CODE_NO_PENDING_ANSWER,
+                                            None,
+                                            &err.to_string(),
+                                        ),
+                                        Err(other) => proto::error_reply(
+                                            &envelope.id,
+                                            client_id,
+                                            CODE_SESSION_UNAVAILABLE,
+                                            None,
+                                            &other.to_string(),
+                                        ),
+                                    },
+                                    None => proto::error_reply(
+                                        &envelope.id,
+                                        client_id,
+                                        CODE_UNKNOWN_SESSION,
+                                        None,
+                                        &format!("no such session: {session}"),
+                                    ),
+                                };
+                                let Ok(raw) = proto::encode(&reply) else { continue };
+                                debug::outgoing(cfg, "wire", reply.msg_type.as_wire_str())
+                                    .id(&envelope.id)
+                                    .peer(client_id)
+                                    .field("session", session.as_str())
+                                    .frame(|| raw.clone())
+                                    .emit();
+                                if ws.send(Message::Text(raw.into())).await.is_err() {
+                                    return LoopExit::Dropped("failed to send answer reply".to_string());
                                 }
                             }
                             // `hello`/`presence`/`reply`/`ack`/anything

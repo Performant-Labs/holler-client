@@ -100,6 +100,22 @@ impl SessionDriver {
         }
     }
 
+    /// Answers whichever question/permission is currently blocking this
+    /// session's turn (holler-server issue #382). Only attach-mode
+    /// sessions can service this today: ACP v1's analogous request
+    /// (`session/request_permission`) is a real inbound RPC call this
+    /// driver would need to intercept and hold open pending a reply,
+    /// which `AcpDriver` does not do yet (see its `DriverStatus::Blocked`
+    /// doc comment) — out of scope here, so a spawn-mode session reports
+    /// a clear, typed [`DriverError::AnswerUnsupported`] rather than
+    /// silently doing nothing.
+    async fn answer(&self, choice: String) -> Result<(), DriverError> {
+        match self {
+            SessionDriver::Acp(_) => Err(DriverError::AnswerUnsupported),
+            SessionDriver::Http(d) => d.answer(choice).await,
+        }
+    }
+
     async fn next_event(&mut self) -> Option<DriverEvent> {
         match self {
             SessionDriver::Acp(d) => d.next_event().await,
@@ -178,6 +194,9 @@ pub enum InterruptOutcome {
 enum ManagerCommand {
     Prompt(String),
     Interrupt(oneshot::Sender<Result<InterruptOutcome, ManagerError>>),
+    /// Answer whichever question/permission is currently blocking this
+    /// session's turn (holler-server issue #382).
+    Answer(String, oneshot::Sender<Result<(), ManagerError>>),
     /// Whether a turn is currently in flight (issue #49: presence's
     /// `busy` field). Answered synchronously from `run_session`'s own
     /// `busy` flag, the same one `Prompt`/`Interrupt` already consult.
@@ -273,6 +292,23 @@ impl SessionManager {
         handle
             .command_tx
             .send(ManagerCommand::Interrupt(reply_tx))
+            .map_err(|_| ManagerError::Disconnected)?;
+        reply_rx.await.map_err(|_| ManagerError::Disconnected)?
+    }
+
+    /// Answers whichever question/permission is currently blocking the
+    /// named session's turn (holler-server issue #382). Only attach-mode
+    /// sessions can service this today — a spawn-mode session reports
+    /// [`ManagerError::Driver`] wrapping [`DriverError::AnswerUnsupported`].
+    pub async fn answer(&self, name: &str, choice: String) -> Result<(), ManagerError> {
+        let handle = self
+            .handles
+            .get(name)
+            .ok_or_else(|| ManagerError::UnknownSession(name.to_string()))?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .command_tx
+            .send(ManagerCommand::Answer(choice, reply_tx))
             .map_err(|_| ManagerError::Disconnected)?;
         reply_rx.await.map_err(|_| ManagerError::Disconnected)?
     }
@@ -414,6 +450,10 @@ async fn run_session(
                             };
                             let _ = reply_tx.send(result);
                         }
+                        Some(ManagerCommand::Answer(choice, reply_tx)) => {
+                            let result = driver.answer(choice).await.map_err(ManagerError::Driver);
+                            let _ = reply_tx.send(result);
+                        }
                         Some(ManagerCommand::IsBusy(reply_tx)) => {
                             let _ = reply_tx.send(busy);
                         }
@@ -476,6 +516,10 @@ async fn run_session(
                     } else {
                         Ok(InterruptOutcome::NoTurnInFlight)
                     };
+                    let _ = reply_tx.send(result);
+                }
+                Some(ManagerCommand::Answer(choice, reply_tx)) => {
+                    let result = driver.answer(choice).await.map_err(ManagerError::Driver);
                     let _ = reply_tx.send(result);
                 }
                 Some(ManagerCommand::IsBusy(reply_tx)) => {

@@ -43,10 +43,51 @@
 //!   "text"`, keyed to its message by `properties.part.messageID`),
 //!   `session.status` (`properties.status.type` is `"busy"` or `"idle"`),
 //!   and `session.idle` (a distinct, final "this turn is over" event).
+//!
+//! # Question/permission detection and reply (holler-client issue #133,
+//! holler-server issue #382), pinned against the same running `opencode
+//! serve` v1.18.20 by curling its `/doc` OpenAPI spec and its real
+//! `/question`/`/permission` responses
+//!
+//! OpenCode has a real `question` tool (structured multiple-choice,
+//! distinct from free-text prompting) and a separate tool-use
+//! `permission` gate; both genuinely block the agent's turn until
+//! answered. Neither is observable on the `/event` SSE stream this
+//! driver already reads (verified: no `question.*`/`permission.*` event
+//! ever appears there), so this driver **polls** instead, on
+//! [`BLOCK_POLL_INTERVAL`]:
+//!
+//! - **List**: `GET {endpoint}/question` / `GET {endpoint}/permission` —
+//!   global (all sessions), each item's JSON field is `id` (**not**
+//!   `requestID` — that name is only the URL path parameter), plus
+//!   `sessionID`, which this driver filters on since there is no
+//!   per-session list endpoint that actually returns data (the v2-style
+//!   `/api/session/{id}/question` path exists in the OpenAPI doc but
+//!   returned empty even with a real question pending).
+//! - **Question shape**: `{id, sessionID, questions: [{question, header,
+//!   options: [{label, description}], multiple?, custom?}], tool?}`.
+//!   Only single-question requests (`questions.len() == 1`, the common
+//!   case) are answerable by [`HttpAttachDriver::answer`] today — a
+//!   multi-question request's `choice` argument has nowhere unambiguous
+//!   to go with a single CLI argument (scope cut, issue #133/#382).
+//! - **Permission shape**: `{id, sessionID, permission, patterns,
+//!   metadata, always, tool?}` — no options list; the real reply
+//!   vocabulary is a fixed three-way enum (see below).
+//! - **Question reply**: `POST {endpoint}/question/{id}/reply`, body
+//!   `{"answers": [["<exact option label>"]]}` (one array of chosen
+//!   labels per question — this driver only ever sends one, for the
+//!   single supported question). 404s with `QuestionNotFoundError` for
+//!   an unknown/already-answered id.
+//! - **Permission reply**: `POST {endpoint}/permission/{id}/reply`, body
+//!   `{"reply": "once" | "always" | "reject"}` — **not** the
+//!   `{"answers": [[...]]}` shape questions use; permission's vocabulary
+//!   is closed and unrelated to any options list. 404s with
+//!   `PermissionNotFoundError` for an unknown/already-answered id.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -56,8 +97,38 @@ use crate::acp_driver::{DriverError, DriverEvent, DriverStatus, DriverStopReason
 use crate::config::SessionConfig;
 use crate::debug::{self, DebugConfig};
 
+/// How often the background loop polls `GET {endpoint}/question` and
+/// `GET {endpoint}/permission` for an item matching this session (issue
+/// #133/#382) — see the module docs for why polling, not SSE, is used.
+/// Frequent enough that a real question/permission is detected promptly
+/// without perceptible lag to an operator watching the roster, cheap
+/// enough (two GETs to a local loopback process) not to matter. `pub`
+/// so regression tests can wait a precise multiple of it rather than
+/// guessing a sleep duration.
+pub const BLOCK_POLL_INTERVAL: Duration = Duration::from_millis(750);
+
 enum Command {
     Prompt(String),
+}
+
+/// Which real OpenCode endpoint a [`PendingBlock`] answers against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    Question,
+    Permission,
+}
+
+/// One currently-pending question or permission for this driver's
+/// session, as last observed by the background poll loop (issue
+/// #133/#382). `options` is only populated for a question (the exact
+/// labels [`HttpAttachDriver::answer`] resolves an index or literal
+/// match against); a permission's reply vocabulary is the fixed
+/// `once`/`always`/`reject` enum, not an options list.
+#[derive(Debug, Clone)]
+struct PendingBlock {
+    kind: BlockKind,
+    id: String,
+    options: Vec<String>,
 }
 
 /// A running attach driver for one already-existing OpenCode session.
@@ -82,6 +153,13 @@ pub struct HttpAttachDriver {
     /// OpenCode's event stream has no cancellation-specific event of its
     /// own to key off instead.
     interrupt_requested: Arc<AtomicBool>,
+    /// The question/permission currently blocking this session's turn,
+    /// if any, as last observed by the background poll loop (issue
+    /// #133/#382). Read directly by [`HttpAttachDriver::answer`]
+    /// (a direct POST, bypassing the background loop entirely — the
+    /// same pattern [`HttpAttachDriver::interrupt`] already uses) and
+    /// written by the background loop's poll tick.
+    pending_block: Arc<Mutex<Option<PendingBlock>>>,
     debug: DebugConfig,
 }
 
@@ -136,11 +214,13 @@ impl HttpAttachDriver {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let interrupt_requested = Arc::new(AtomicBool::new(false));
+        let pending_block = Arc::new(Mutex::new(None));
 
         let loop_client = client.clone();
         let loop_endpoint = endpoint.clone();
         let loop_session_id = session_id.clone();
         let loop_interrupt_flag = interrupt_requested.clone();
+        let loop_pending_block = pending_block.clone();
         let connection = tokio::spawn(async move {
             run_http_loop(
                 loop_client,
@@ -149,6 +229,7 @@ impl HttpAttachDriver {
                 command_rx,
                 event_tx,
                 loop_interrupt_flag,
+                loop_pending_block,
                 cfg,
             )
             .await;
@@ -162,6 +243,7 @@ impl HttpAttachDriver {
             endpoint,
             session_id,
             interrupt_requested,
+            pending_block,
             debug: cfg,
         })
     }
@@ -203,6 +285,117 @@ impl HttpAttachDriver {
                 response.status()
             )));
         }
+        Ok(())
+    }
+
+    /// Answers whichever question/permission is currently blocking this
+    /// session's turn (holler-server issue #382), resolving `choice`
+    /// against the real pending request's shape (an option index or
+    /// exact label for a question; `once`/`always`/`reject`, plus common
+    /// aliases, for a permission) and POSTing the reply directly —
+    /// bypassing the background poll loop entirely, the same pattern
+    /// [`interrupt`](Self::interrupt) already uses for its own direct
+    /// POST. `Err(DriverError::NoPendingAnswer(_))` covers every
+    /// rejection: nothing pending, an out-of-range index, an unmatched
+    /// label, or an unrecognized permission reply.
+    pub async fn answer(&self, choice: String) -> Result<(), DriverError> {
+        let pending = self
+            .pending_block
+            .lock()
+            .expect("pending-block mutex poisoned")
+            .clone();
+        let Some(pending) = pending else {
+            return Err(DriverError::NoPendingAnswer(format!(
+                "no question or permission is pending for session {}",
+                self.session_id
+            )));
+        };
+
+        match pending.kind {
+            BlockKind::Permission => {
+                let Some(reply) = normalize_permission_reply(&choice) else {
+                    return Err(DriverError::NoPendingAnswer(format!(
+                        "invalid permission choice {choice:?}; expected one of \
+                         once/allow, always, reject/deny"
+                    )));
+                };
+                let url = format!(
+                    "{}/permission/{}/reply",
+                    self.endpoint.trim_end_matches('/'),
+                    pending.id
+                );
+                let body = serde_json::json!({ "reply": reply });
+                debug::outgoing(self.debug, "http_attach", "answer")
+                    .field("session", self.session_id.clone())
+                    .field("kind", "permission")
+                    .field("reply", reply)
+                    .emit();
+                let response = self
+                    .client
+                    .post(&url)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|err| DriverError::Http(err.to_string()))?;
+                debug::incoming(self.debug, "http_attach", "answer")
+                    .field("status", response.status().as_str())
+                    .emit();
+                if !response.status().is_success() {
+                    return Err(DriverError::Http(format!(
+                        "permission reply returned HTTP {}",
+                        response.status()
+                    )));
+                }
+            }
+            BlockKind::Question => {
+                let Some(label) = resolve_question_choice(&choice, &pending.options) else {
+                    return Err(DriverError::NoPendingAnswer(format!(
+                        "invalid question choice {choice:?}; expected an option index \
+                         (0-{}) or an exact label from {:?}",
+                        pending.options.len().saturating_sub(1),
+                        pending.options
+                    )));
+                };
+                let url = format!(
+                    "{}/question/{}/reply",
+                    self.endpoint.trim_end_matches('/'),
+                    pending.id
+                );
+                let body = serde_json::json!({ "answers": [[label]] });
+                debug::outgoing(self.debug, "http_attach", "answer")
+                    .field("session", self.session_id.clone())
+                    .field("kind", "question")
+                    .field("reply", label.as_str())
+                    .emit();
+                let response = self
+                    .client
+                    .post(&url)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|err| DriverError::Http(err.to_string()))?;
+                debug::incoming(self.debug, "http_attach", "answer")
+                    .field("status", response.status().as_str())
+                    .emit();
+                if !response.status().is_success() {
+                    return Err(DriverError::Http(format!(
+                        "question reply returned HTTP {}",
+                        response.status()
+                    )));
+                }
+            }
+        }
+
+        // Deliberately NOT clearing `pending_block` here: the background
+        // poll loop is the single source of truth for it (so a
+        // real-but-unanswered/replaced question the server still has
+        // right after this reply is never lost to a race), and it will
+        // observe this id is gone on its very next tick and emit the
+        // unblocked transition itself. A second `answer` landing before
+        // that tick would just get OpenCode's own 404
+        // (`QuestionNotFoundError`/`PermissionNotFoundError`) surfaced
+        // as `DriverError::Http`, which is an accurate report — nothing
+        // is pending to apply it to anymore.
         Ok(())
     }
 
@@ -368,11 +561,74 @@ struct OcStatus {
     kind: String,
 }
 
+/// One pending item from `GET {endpoint}/question` (issue #133/#382),
+/// per OpenCode's real `QuestionRequest` schema (`/doc`'s OpenAPI spec,
+/// v1.18.20) — the JSON field is `id`, not `requestID` (that name is
+/// only the URL path parameter on the reply/reject endpoints).
+#[derive(Debug, Deserialize)]
+struct OcQuestionRequest {
+    id: String,
+    #[serde(rename = "sessionID")]
+    session_id: String,
+    questions: Vec<OcQuestionInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OcQuestionInfo {
+    options: Vec<OcQuestionOption>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OcQuestionOption {
+    label: String,
+}
+
+/// One pending item from `GET {endpoint}/permission` (issue #133/#382),
+/// per OpenCode's real `PermissionRequest` schema. Only `id`/`sessionID`
+/// are needed here — the reply vocabulary (`once`/`always`/`reject`) is
+/// fixed, not derived from anything else in this shape.
+#[derive(Debug, Deserialize)]
+struct OcPermissionRequest {
+    id: String,
+    #[serde(rename = "sessionID")]
+    session_id: String,
+}
+
+/// Maps a `holler-server answer` `choice` to OpenCode's real permission
+/// reply enum (`once`/`always`/`reject`), accepting a few obvious
+/// operator-facing aliases since the wire's `choice` is free text.
+fn normalize_permission_reply(choice: &str) -> Option<&'static str> {
+    match choice.trim().to_ascii_lowercase().as_str() {
+        "once" | "allow" | "approve" | "yes" | "y" => Some("once"),
+        "always" => Some("always"),
+        "reject" | "deny" | "no" | "n" => Some("reject"),
+        _ => None,
+    }
+}
+
+/// Resolves a `holler-server answer` `choice` against a pending
+/// question's real option labels: a 0-based numeric index into
+/// `options`, or an exact (case-insensitive) label match. Returns the
+/// real label OpenCode expects on the wire (`options`' own casing), not
+/// the caller's input.
+fn resolve_question_choice(choice: &str, options: &[String]) -> Option<String> {
+    if let Ok(index) = choice.trim().parse::<usize>() {
+        if let Some(label) = options.get(index) {
+            return Some(label.clone());
+        }
+    }
+    options
+        .iter()
+        .find(|label| label.eq_ignore_ascii_case(choice.trim()))
+        .cloned()
+}
+
 /// Drives one attached session: sends prompts via `prompt_async`, and
 /// concurrently reads the global SSE event stream, translating this
 /// session's own events into [`DriverEvent`]s. Returns once the command
 /// channel closes ([`HttpAttachDriver`] was dropped or
 /// [`HttpAttachDriver::shutdown`] called).
+#[allow(clippy::too_many_arguments)]
 async fn run_http_loop(
     client: reqwest::Client,
     endpoint: String,
@@ -380,6 +636,7 @@ async fn run_http_loop(
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     event_tx: mpsc::UnboundedSender<DriverEvent>,
     interrupt_requested: Arc<AtomicBool>,
+    pending_block: Arc<Mutex<Option<PendingBlock>>>,
     cfg: DebugConfig,
 ) {
     // message id -> role, so a `message.part.updated` (which carries no
@@ -407,6 +664,9 @@ async fn run_http_loop(
         .emit();
     let mut byte_stream = response.bytes_stream();
     let mut buffer = String::new();
+
+    let mut block_poll = tokio::time::interval(BLOCK_POLL_INTERVAL);
+    block_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -467,8 +727,116 @@ async fn run_http_loop(
                     }
                 }
             }
+            _ = block_poll.tick() => {
+                poll_pending_block(&client, &endpoint, &session_id, &pending_block, &event_tx, cfg).await;
+            }
         }
     }
+}
+
+/// One poll tick of the question/permission detection loop (issue
+/// #133/#382): `GET`s both global lists, keeps whichever item (if any)
+/// matches this session, and — only on a real transition — updates
+/// `pending_block` and emits [`DriverEvent::Status`]. A poll that finds
+/// nothing new (same pending id as last tick, or still nothing pending)
+/// is silent: no duplicate `Blocked`/`Working` events every tick.
+async fn poll_pending_block(
+    client: &reqwest::Client,
+    endpoint: &str,
+    session_id: &str,
+    pending_block: &Arc<Mutex<Option<PendingBlock>>>,
+    event_tx: &mpsc::UnboundedSender<DriverEvent>,
+    cfg: DebugConfig,
+) {
+    let found = poll_pending_question(client, endpoint, session_id, cfg)
+        .await
+        .or(poll_pending_permission(client, endpoint, session_id, cfg).await);
+
+    let previous_id = pending_block
+        .lock()
+        .expect("pending-block mutex poisoned")
+        .as_ref()
+        .map(|p| p.id.clone());
+    let found_id = found.as_ref().map(|p| p.id.clone());
+    if previous_id == found_id {
+        return; // no real transition -- same pending item, or still none
+    }
+
+    let became_blocked = found.is_some();
+    *pending_block.lock().expect("pending-block mutex poisoned") = found;
+    if became_blocked {
+        debug::local(cfg, "http_attach", "answer")
+            .field("event", "blocked")
+            .field("session", session_id.to_string())
+            .emit();
+        let _ = event_tx.send(DriverEvent::Status(DriverStatus::Blocked));
+    } else {
+        // Whatever was pending is gone (answered by us or by another
+        // channel, or timed out on OpenCode's own side) -- the turn is
+        // presumably continuing; the next real SSE `session.idle` (if
+        // any) still settles the final status precisely.
+        debug::local(cfg, "http_attach", "answer")
+            .field("event", "unblocked")
+            .field("session", session_id.to_string())
+            .emit();
+        let _ = event_tx.send(DriverEvent::Status(DriverStatus::Working));
+    }
+}
+
+async fn poll_pending_question(
+    client: &reqwest::Client,
+    endpoint: &str,
+    session_id: &str,
+    cfg: DebugConfig,
+) -> Option<PendingBlock> {
+    let url = format!("{}/question", endpoint.trim_end_matches('/'));
+    let response = client.get(&url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let requests: Vec<OcQuestionRequest> = response.json().await.ok()?;
+    let request = requests.into_iter().find(|r| r.session_id == session_id)?;
+    if request.questions.len() != 1 {
+        // Scope cut (issue #133/#382): a single `choice` argument has no
+        // unambiguous way to answer more than one question in a request.
+        // Still report `Blocked` so the operator isn't left guessing why
+        // the turn is stuck, just without an answerable `PendingBlock`.
+        debug::warn(cfg, "http_attach", "answer")
+            .field("event", "multi_question_unsupported")
+            .field("session", session_id.to_string())
+            .emit();
+        return None;
+    }
+    let options = request.questions[0]
+        .options
+        .iter()
+        .map(|o| o.label.clone())
+        .collect();
+    Some(PendingBlock {
+        kind: BlockKind::Question,
+        id: request.id,
+        options,
+    })
+}
+
+async fn poll_pending_permission(
+    client: &reqwest::Client,
+    endpoint: &str,
+    session_id: &str,
+    _cfg: DebugConfig,
+) -> Option<PendingBlock> {
+    let url = format!("{}/permission", endpoint.trim_end_matches('/'));
+    let response = client.get(&url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let requests: Vec<OcPermissionRequest> = response.json().await.ok()?;
+    let request = requests.into_iter().find(|r| r.session_id == session_id)?;
+    Some(PendingBlock {
+        kind: BlockKind::Permission,
+        id: request.id,
+        options: Vec::new(),
+    })
 }
 
 fn handle_event(

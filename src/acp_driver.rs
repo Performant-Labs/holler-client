@@ -79,9 +79,14 @@ pub enum DriverEvent {
 /// ACP v1's base session lifecycle has no distinct "blocked" signal — the
 /// closest analog is an agent-initiated permission request
 /// (`session/request_permission`), which blocks the turn on a client
-/// decision. This driver does not yet handle permission requests (out of
-/// scope for issue #26; a future story can add it), so [`Blocked`] is
-/// reserved but never emitted today.
+/// decision. This driver (spawn mode) does not yet handle permission
+/// requests (out of scope for issue #26; a future story can add it), so
+/// [`Blocked`] is never emitted by [`AcpDriver`] today.
+///
+/// [`crate::http_attach_driver::HttpAttachDriver`] (attach mode) DOES
+/// emit [`Blocked`] (holler-client issue #133 / holler-server issue
+/// #382), for OpenCode's real, analogous `question`/permission gates —
+/// see that module's docs for detection + reply.
 ///
 /// [`Blocked`]: DriverStatus::Blocked
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,9 +95,10 @@ pub enum DriverStatus {
     Working,
     /// No turn is in flight.
     Idle,
-    /// Reserved: would indicate a pending agent-initiated request (e.g.
-    /// permission) blocking the turn. Never emitted today; see the
-    /// enum-level doc comment.
+    /// A pending agent-initiated request (question or permission) is
+    /// blocking the turn. Emitted by the attach-mode HTTP driver; never
+    /// emitted by [`AcpDriver`] (spawn mode) today — see the enum-level
+    /// doc comment.
     Blocked,
 }
 
@@ -153,6 +159,18 @@ pub enum DriverError {
     /// `reqwest::Error` itself, matching this module's existing `Acp`
     /// variant's shape.
     Http(String),
+    /// `answer` (holler-server issue #382) named a session with no
+    /// question/permission actually pending right now, or a `choice`
+    /// that did not resolve to a real option (an index in range, or an
+    /// exact label/permission-reply match). Carries a human-readable
+    /// detail for the CLI to report back to the operator.
+    NoPendingAnswer(String),
+    /// `answer` (issue #382) targeted a spawn-mode (ACP) session: ACP
+    /// v1's analogous request (`session/request_permission`) is a real
+    /// inbound RPC call [`AcpDriver`] does not intercept yet (see
+    /// [`DriverStatus::Blocked`]'s doc comment) — only attach-mode
+    /// sessions can answer a question/permission today.
+    AnswerUnsupported,
 }
 
 impl std::fmt::Display for DriverError {
@@ -171,6 +189,12 @@ impl std::fmt::Display for DriverError {
                  never creating a new session in its place"
             ),
             DriverError::Http(message) => write!(f, "attach HTTP driver error: {message}"),
+            DriverError::NoPendingAnswer(detail) => write!(f, "cannot answer: {detail}"),
+            DriverError::AnswerUnsupported => write!(
+                f,
+                "answering a question/permission is only supported for attach-mode \
+                 sessions, not spawn-mode (ACP) sessions"
+            ),
         }
     }
 }
