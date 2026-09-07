@@ -106,8 +106,7 @@ enum Command {
         args: Vec<String>,
     },
     /// Set up attach mode against a real, already-running OpenCode HTTP
-    /// endpoint (issue #109) — replaces hand-rolling
-    /// `curl {endpoint}/session | json.tool` to find a session id.
+    /// endpoint.
     Attach {
         #[command(subcommand)]
         action: AttachCommand,
@@ -117,7 +116,7 @@ enum Command {
 /// Default OpenCode HTTP endpoint both `attach` subcommands probe when
 /// `--endpoint` is omitted — matches `opencode serve`'s and the bare
 /// `opencode` TUI's own default port, so zero-arg usage against a locally
-/// running OpenCode just works (issue #109's explicit requirement).
+/// running OpenCode just works.
 const DEFAULT_ATTACH_ENDPOINT: &str = "http://127.0.0.1:4096";
 
 #[derive(Subcommand)]
