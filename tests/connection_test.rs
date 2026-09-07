@@ -144,6 +144,29 @@ command = ["{stub_acp}", "--chunks", "{chunks}"]
         self
     }
 
+    /// Like [`Env::with_stub_acp_chunks`], but the stub sleeps for a fixed
+    /// ~500ms (`PAUSE_DURATION` in `stub-acp`) after emitting the
+    /// `pause_after_chunk`th update of a turn — for holler-server#98's
+    /// hlrclnt-1618 (mid-turn network blip), giving a test a wide,
+    /// deterministic window to drop the connection strictly between two
+    /// batches of a streamed turn.
+    fn with_stub_acp_chunks_paused(self, chunks: usize, pause_after_chunk: usize) -> Self {
+        let stub_acp = env!("CARGO_BIN_EXE_stub-acp");
+        std::fs::write(
+            &self.config_path,
+            format!(
+                r#"
+[[session]]
+name = "test-alpha"
+harness = "stub-acp"
+command = ["{stub_acp}", "--chunks", "{chunks}", "--pause-after-chunk", "{pause_after_chunk}"]
+"#
+            ),
+        )
+        .unwrap();
+        self
+    }
+
     fn with_stub_acp_sessions(self) -> Self {
         let stub_acp = env!("CARGO_BIN_EXE_stub-acp");
         std::fs::write(
@@ -592,6 +615,153 @@ async fn reconnect_with_backoff_triggers_and_eventually_succeeds() {
 
     let status = env.wait_for_status(STATUS_BUDGET, |doc| doc["connected"] == true);
     assert_eq!(status["reconnecting"], false);
+
+    kill(child);
+}
+
+// hlrclnt-1618: a real WS drop while a turn is actively streaming -- not a
+// clean idle disconnect (the test above) and not a full process restart
+// (hlrclnt-1602, holler-client's own tests/network.rs, which never has a
+// turn in flight). stub-acp's `--pause-after-chunk` gives a wide,
+// deterministic window to drop the connection strictly between two
+// DriverEvent batches of one turn, rather than racing real local-IPC
+// timing. Pins the real, current, verified behavior: `EventChannels`
+// persists across a reconnect (owned by `connection::run`'s caller, not
+// `session_loop`), so stub-acp's post-drop chunks are neither lost nor
+// duplicated -- they arrive on the reconnected connection, exactly once,
+// concatenated correctly. `last_prompt_id` is per-connection state,
+// though (`session_loop`'s own doc comment: "a turn that outlives a
+// reconnect loses this correlation"), so that tail arrives with a freshly
+// generated id, not the original prompt's -- a well-defined, if
+// uncorrelated, outcome rather than a stuck one.
+#[tokio::test]
+async fn mid_turn_disconnect_delivers_the_turns_tail_after_reconnect_uncorrelated_and_intact() {
+    const CHUNKS: usize = 10;
+    const PAUSE_AFTER: usize = 3;
+
+    let env = Env::new().with_stub_acp_chunks_paused(CHUNKS, PAUSE_AFTER);
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "tok_blip1", "cli_blip1", "blip-host");
+
+    let child = spawn_run(&env);
+
+    // First connection: start the turn, confirm the pre-pause chunks
+    // stream correctly (correlated to the prompt's own id, not yet
+    // done), then drop -- deterministically before stub-acp's pause ends
+    // and the remaining chunks are even generated.
+    let request = {
+        let mut ws = accept_ws(&listener).await;
+        expect_auth(&mut ws, "tok_blip1").await;
+        send_envelope(&mut ws, &server_hello_envelope()).await;
+        next_envelope(&mut ws).await.expect("expected client `hello`");
+        next_envelope(&mut ws)
+            .await
+            .expect("expected client `presence`");
+
+        let request = prompt_envelope("test-alpha", "hello");
+        send_envelope(&mut ws, &request).await;
+
+        // The coalescer's 50ms debounce window flushes the first
+        // PAUSE_AFTER chunks as one non-terminal frame well inside
+        // stub-acp's 500ms pause.
+        let frame = next_envelope(&mut ws)
+            .await
+            .expect("expected a non-terminal reply frame before the pause");
+        assert_eq!(
+            frame.id, request.id,
+            "pre-drop chunks must reuse the prompt's id"
+        );
+        match frame.body {
+            Body::Reply(proto::ReplyBody {
+                session,
+                text,
+                chunks,
+                done,
+                ..
+            }) => {
+                assert_eq!(session, "test-alpha");
+                let mut assembled = String::new();
+                if let Some(t) = text {
+                    assembled.push_str(&t);
+                }
+                for c in chunks {
+                    assembled.push_str(&c);
+                }
+                assert_eq!(assembled, "PONG".repeat(PAUSE_AFTER));
+                assert!(!done, "the turn must not read as done before the pause");
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+
+        let _ = ws.close(None).await;
+        request
+    };
+
+    env.wait_for_status(STATUS_BUDGET, |doc| doc["reconnecting"] == true);
+
+    // Second connection: the client's own reconnect loop recovers.
+    // stub-acp never knew the network dropped -- it just kept going after
+    // its pause -- so the turn's tail arrives here instead.
+    let mut ws2 = accept_ws(&listener).await;
+    expect_auth(&mut ws2, "tok_blip1").await;
+    send_envelope(&mut ws2, &server_hello_envelope()).await;
+    next_envelope(&mut ws2)
+        .await
+        .expect("expected client `hello` after reconnect");
+    next_envelope(&mut ws2)
+        .await
+        .expect("expected client `presence` after reconnect");
+
+    let mut assembled = String::new();
+    let mut terminal_frames = 0;
+    let mut ids_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        let frame = next_envelope(&mut ws2)
+            .await
+            .expect("expected the turn's tail to arrive on the reconnected connection");
+        ids_seen.insert(frame.id.clone());
+        match frame.body {
+            Body::Reply(proto::ReplyBody {
+                session,
+                text,
+                chunks,
+                done,
+                ..
+            }) => {
+                assert_eq!(session, "test-alpha");
+                if let Some(t) = text {
+                    assembled.push_str(&t);
+                }
+                for c in chunks {
+                    assembled.push_str(&c);
+                }
+                if done {
+                    terminal_frames += 1;
+                    break;
+                }
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        assembled,
+        "PONG".repeat(CHUNKS - PAUSE_AFTER),
+        "the tail must arrive exactly once: no duplication of the pre-drop \
+         chunks, no loss of the post-reconnect ones"
+    );
+    assert_eq!(terminal_frames, 1, "exactly one frame closes the turn");
+    assert!(
+        !ids_seen.contains(&request.id),
+        "the tail must not reuse the original prompt's id -- last_prompt_id \
+         is per-connection state, reset by the reconnect"
+    );
+
+    let status = env.wait_for_status(STATUS_BUDGET, |doc| doc["connected"] == true);
+    assert_eq!(
+        status["reconnecting"], false,
+        "the session must end up in a well-defined connected state, not stuck"
+    );
 
     kill(child);
 }
