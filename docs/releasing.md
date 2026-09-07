@@ -35,6 +35,10 @@ but the process is identical. This page only covers what's specific to holler-cl
   no Windows support). The policy itself (known issues aren't blockers for a beta, but must be
   checked and named in the notes) is holler-server's `docs/releasing.md` "Known issues" section —
   identical here, not repeated.
+- **`README.md` gets updated too, same as holler-server's** — notable user-facing features, fixes,
+  or CLI-invocation changes from this release. Explicit call-out here on purpose: this step lives
+  in holler-server's step-by-step (linked below), and a reader of only this page could otherwise
+  miss that it applies here as well.
 
 Everything else — version bump rules, tag format (`vX.Y.Z`, signed/annotated), `CHANGELOG.md`
 conventions, the two-tier "tag+CHANGELOG always, GitHub Release with binaries as a confirmed
