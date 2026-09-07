@@ -240,6 +240,54 @@ pub async fn probe_session_exists(endpoint: &str, session_id: &str) -> bool {
     }
 }
 
+/// One real session as returned by `GET {endpoint}/session` (issue #109's
+/// `holler attach sessions`/`holler attach init` — verified live against
+/// `opencode serve` v1.18.20: a real session object carries at least these
+/// fields, plus several this driver doesn't need, which `serde`'s default
+/// unknown-field-ignoring behavior leaves alone).
+#[derive(Debug, Clone, Deserialize)]
+pub struct OcSessionSummary {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub time: OcSessionTime,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct OcSessionTime {
+    /// Unix epoch milliseconds. Used to pick the most recently active
+    /// session (`holler attach init`'s no-`--session` default) — sorting by
+    /// this rather than trusting the endpoint's own array order, since
+    /// nothing about `GET /session`'s contract promises an order.
+    #[serde(default)]
+    pub updated: i64,
+}
+
+/// Lists every real session at `endpoint`, right now, newest-updated first
+/// (issue #109). One real GET, no retry loop — same "ask once, fail closed"
+/// shape as [`probe_session_exists`].
+pub async fn list_sessions(endpoint: &str) -> Result<Vec<OcSessionSummary>, String> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/session", endpoint.trim_end_matches('/'));
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| format!("could not reach {endpoint}: {err}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "listing sessions at {endpoint} returned HTTP {}",
+            response.status()
+        ));
+    }
+    let mut sessions: Vec<OcSessionSummary> = response
+        .json()
+        .await
+        .map_err(|err| format!("could not parse session list from {endpoint}: {err}"))?;
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.time.updated));
+    Ok(sessions)
+}
+
 /// Probes every attach-mode session in `registry` for real, right now,
 /// returning the names of the ones whose configured `endpoint`/`session_id`
 /// currently answer. Spawn sessions are never included here — they're

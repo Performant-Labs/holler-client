@@ -61,7 +61,11 @@ pub struct SessionConfig {
     pub harness: String,
     #[serde(default)]
     pub mode: SessionMode,
-    #[serde(default)]
+    /// Rendered as absent (not `command = []`) when empty, so
+    /// `holler attach init`'s output matches ADR-0005's normative attach
+    /// shape exactly — `command` is never a spawn-mode consolation prize
+    /// for an attach session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
     /// Optional interrupt signal/command for the session's harness process.
     /// Modeled as a single string (e.g. a signal name like `"SIGINT"`)
@@ -89,10 +93,22 @@ impl SessionConfig {
 }
 
 /// Top-level shape of the TOML config file: a `[[session]]` array of tables.
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
 struct BodyConfig {
     #[serde(default)]
     session: Vec<SessionConfig>,
+}
+
+/// Renders a single session as a standalone `[[session]]` TOML document
+/// (issue #109's `holler attach init`) — reuses [`SessionConfig`]'s own
+/// `Serialize` impl rather than a second, hand-written TOML writer, so the
+/// file `holler attach init` produces and the one [`load`] parses are
+/// provably the same shape.
+pub fn render_attach_toml(session: &SessionConfig) -> Result<String, ConfigError> {
+    let doc = BodyConfig {
+        session: vec![session.clone()],
+    };
+    toml::to_string_pretty(&doc).map_err(ConfigError::Serialize)
 }
 
 /// Errors from loading or validating body config.
@@ -102,6 +118,11 @@ pub enum ConfigError {
     Io(std::io::Error),
     /// The config file's TOML could not be parsed.
     Parse(toml::de::Error),
+    /// A session could not be rendered back to TOML (`holler attach init`,
+    /// issue #109). Not expected to ever actually happen for a
+    /// `SessionConfig` this crate built itself — kept as a real error
+    /// rather than an `unwrap()` since it crosses a serialization boundary.
+    Serialize(toml::ser::Error),
     /// Two or more sessions in the config share the same name. Fail-closed
     /// rather than silently deduplicating, since a silent drop would hide
     /// a session the caller expected to exist.
@@ -125,6 +146,7 @@ impl fmt::Display for ConfigError {
         match self {
             ConfigError::Io(e) => write!(f, "failed to read config file: {e}"),
             ConfigError::Parse(e) => write!(f, "failed to parse config TOML: {e}"),
+            ConfigError::Serialize(e) => write!(f, "failed to render config TOML: {e}"),
             ConfigError::DuplicateSessionName(name) => {
                 write!(f, "duplicate session name in config: {name}")
             }
@@ -150,6 +172,7 @@ impl std::error::Error for ConfigError {
         match self {
             ConfigError::Io(e) => Some(e),
             ConfigError::Parse(e) => Some(e),
+            ConfigError::Serialize(e) => Some(e),
             ConfigError::DuplicateSessionName(_)
             | ConfigError::SpawnMissingCommand(_)
             | ConfigError::AttachMissingEndpoint(_)
