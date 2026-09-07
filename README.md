@@ -49,6 +49,24 @@ Other commands, run locally on this machine (no live `run` process required for 
 
 `--config <path>` works with any of these, not just `run` — pass the same session file so `status`/`caps` report the sessions you actually intend to run, not an empty list.
 
+**`holler detach` means leave the circuit** — it drops the live WebSocket and deletes the persisted credential, nothing else. It does **not** kill an OpenCode session. For a `mode = "spawn"` session (the default, above), that distinction is easy to miss because this process *is* that session's parent: `holler run`'s own shutdown tears down the ACP child it spawned, independently of whether `detach` was ever called, simply because the process that owns the child is exiting. For a `mode = "attach"` session (see [Attach mode](#attach-mode-herdr-owned-opencode) below), there is no child to tear down — `detach` closes the control channel and the OpenCode session (and whatever pane/TUI Herdr is showing it in) keeps running exactly as it was.
+
+### Attach mode (Herdr-owned OpenCode)
+
+The Quickstart above is **spawn mode** (the default): this process starts its own `opencode acp` child and owns it. **Attach mode** is for a machine that's already running Herdr with a live OpenCode TUI in a pane — `holler run` becomes a sidecar next to that pane, not its parent, and talks to that *same* OpenCode session over HTTP instead of spawning a second one:
+
+```toml
+[[session]]
+name = "alpha"
+harness = "opencode"
+mode = "attach"
+endpoint = "http://127.0.0.1:4096"   # wherever that OpenCode's HTTP server is listening
+session_id = "ses_…"                # the id of the session already running in the Herdr pane
+# command is ignored in attach mode — this session is never spawned
+```
+
+`holler run --config attach.toml` against this config never execs `opencode`, never calls OpenCode's `session/new`, and — per the detach note above — never tears down the attached session on shutdown/detach. Mixing modes in one file (some sessions spawned, some attached) is fine. See [ADR 0005](docs/adr/ADR-0005.md) for the full policy and [holler-server](https://github.com/Performant-Labs/holler-server)'s `docs/protocol/talk.md` for the attach hop once that lands.
+
 ### Dev scripts
 
 Wraps the connect side of a manual cross-machine test (tunnel + run) per the org's `object:sub-object:verb` script-naming convention ([`Performant-Labs/playbook`](https://github.com/Performant-Labs/playbook/blob/main/frameworks/node/npm-scripts.md)). This crate has no `package.json`, so `./scripts/run <name>` is the `npm run <name>` equivalent — the actual command you type, not just a documented mapping:
