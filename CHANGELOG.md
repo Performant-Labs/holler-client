@@ -17,6 +17,10 @@ pre-decision history.
   transition happens — not just at connect/reconnect like `presence`. A session already
   blocked when a connection drops is resynced right after `presence` on the fresh
   connection, since the transition itself does not repeat.
+- `answer` now resolves a request with more than one pending question (issue #139) — a
+  comma-separated `choice`, one segment per question in order (each an index or exact
+  label), resolved independently against its own question's options. A single-question
+  request keeps working with a bare, comma-free `choice` exactly as before.
 
 ## [0.1.1] - 2026-09-07
 
