@@ -10,6 +10,8 @@ pre-decision history.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-07
+
 ### Enhancements
 
 - A session's `Blocked` status (a real OpenCode question/permission gate) is now pushed
@@ -21,6 +23,16 @@ pre-decision history.
   comma-separated `choice`, one segment per question in order (each an index or exact
   label), resolved independently against its own question's options. A single-question
   request keeps working with a bare, comma-free `choice` exactly as before.
+
+### Known Issues
+
+- `tests/http_attach_answer_test.rs`'s tests are intermittently flaky under full-suite
+  parallel `cargo test` execution (a fast connection-refused failure, or occasionally a
+  genuine hang, caught by CI's 10-minute step timeout) — root-caused to accumulated OS
+  threads from this suite's fake-server test doubles, not a defect in the shipped
+  `answer`/`session_blocked` features, which are verified correct via repeated live and
+  full end-to-end automated testing:
+  [#136](https://github.com/Performant-Labs/holler-client/issues/136).
 
 ## [0.1.1] - 2026-09-07
 
