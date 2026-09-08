@@ -22,11 +22,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # A docs-only PR (README/CHANGELOG/docs/** with no source, test, or
+      # CI-config change) doesn't need a real Rust build/test cycle -- this
+      # keeps the job itself as a REQUIRED check that still runs and passes
+      # quickly, rather than using `paths-ignore` on the workflow trigger
+      # (which would make GitHub never create the check at all, and a
+      # required-but-never-created check permanently blocks merging).
+      - name: Detect docs-only changes
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'src/**'
+              - 'tests/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'scripts/**'
+              - '.github/workflows/**'
+
       - name: Install Rust
+        if: steps.filter.outputs.code == 'true'
         run: rustup toolchain install stable
         shell: pwsh
 
       - name: Full test suite
+        if: steps.filter.outputs.code == 'true'
         run: cargo test
         shell: pwsh
         timeout-minutes: 10
@@ -42,34 +63,40 @@ jobs:
       # subdirectory of the workspace instead -- same effect, a real sibling
       # checkout to build against, just nested rather than a true sibling.
       - name: Checkout holler-server (for real interop tests)
+        if: steps.filter.outputs.code == 'true'
         uses: actions/checkout@v4
         with:
           repository: Performant-Labs/holler-server
           path: holler-server
 
       - name: Build sibling holler-server binary
+        if: steps.filter.outputs.code == 'true'
         run: cargo build --release
         shell: pwsh
         working-directory: holler-server
 
       - name: Interop test -- mint/join/run/roster/status/stop
+        if: steps.filter.outputs.code == 'true'
         env:
           HOLLER_SERVER_BIN: ${{ github.workspace }}/holler-server/target/release/holler-server
         run: cargo test --test interop_smoke_test -- --ignored
         shell: pwsh
 
       - name: Interop test -- SIGINT/SIGTERM on a live run against a real server
+        if: steps.filter.outputs.code == 'true'
         env:
           HOLLER_SERVER_BIN: ${{ github.workspace }}/holler-server/target/release/holler-server
         run: cargo test --test io_behavior -- --ignored
         shell: pwsh
 
       - name: Interop test -- server restart is recovered by the client's reconnect loop
+        if: steps.filter.outputs.code == 'true'
         env:
           HOLLER_SERVER_BIN: ${{ github.workspace }}/holler-server/target/release/holler-server
         run: cargo test --test network -- --ignored
         shell: pwsh
 
       - name: Clippy
+        if: steps.filter.outputs.code == 'true'
         run: cargo clippy --all-targets -- -D warnings
         shell: pwsh
