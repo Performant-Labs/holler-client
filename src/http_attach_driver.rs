@@ -120,15 +120,18 @@ enum BlockKind {
 
 /// One currently-pending question or permission for this driver's
 /// session, as last observed by the background poll loop (issue
-/// #133/#382). `options` is only populated for a question (the exact
-/// labels [`HttpAttachDriver::answer`] resolves an index or literal
-/// match against); a permission's reply vocabulary is the fixed
-/// `once`/`always`/`reject` enum, not an options list.
+/// #133/#382/#139). `options` is only populated for a question — one
+/// inner `Vec` per question in the request, in order (almost always a
+/// single entry; more than one when OpenCode asks several questions in
+/// one request) — the exact labels [`HttpAttachDriver::answer`] resolves
+/// each of a comma-separated `choice`'s parts against. A permission's
+/// reply vocabulary is the fixed `once`/`always`/`reject` enum, not an
+/// options list, so it stays empty for that kind.
 #[derive(Debug, Clone)]
 struct PendingBlock {
     kind: BlockKind,
     id: String,
-    options: Vec<String>,
+    options: Vec<Vec<String>>,
 }
 
 /// A running attach driver for one already-existing OpenCode session.
@@ -348,11 +351,12 @@ impl HttpAttachDriver {
                 }
             }
             BlockKind::Question => {
-                let Some(label) = resolve_question_choice(&choice, &pending.options) else {
+                let Some(labels) = resolve_question_choices(&choice, &pending.options) else {
                     return Err(DriverError::NoPendingAnswer(format!(
-                        "invalid question choice {choice:?}; expected an option index \
-                         (0-{}) or an exact label from {:?}",
-                        pending.options.len().saturating_sub(1),
+                        "invalid question choice {choice:?}; expected {} comma-separated \
+                         choice(s), each an option index or an exact label, matching this \
+                         request's questions in order: {:?}",
+                        pending.options.len(),
                         pending.options
                     )));
                 };
@@ -361,11 +365,13 @@ impl HttpAttachDriver {
                     self.endpoint.trim_end_matches('/'),
                     pending.id
                 );
-                let body = serde_json::json!({ "answers": [[label]] });
+                let answers: Vec<Vec<&str>> =
+                    labels.iter().map(|label| vec![label.as_str()]).collect();
+                let body = serde_json::json!({ "answers": answers });
                 debug::outgoing(self.debug, "http_attach", "answer")
                     .field("session", self.session_id.clone())
                     .field("kind", "question")
-                    .field("reply", label.as_str())
+                    .field("reply", labels.join(","))
                     .emit();
                 let response = self
                     .client
@@ -606,11 +612,10 @@ fn normalize_permission_reply(choice: &str) -> Option<&'static str> {
     }
 }
 
-/// Resolves a `holler-server answer` `choice` against a pending
-/// question's real option labels: a 0-based numeric index into
-/// `options`, or an exact (case-insensitive) label match. Returns the
-/// real label OpenCode expects on the wire (`options`' own casing), not
-/// the caller's input.
+/// Resolves one `choice` segment against a single question's real option
+/// labels: a 0-based numeric index into `options`, or an exact
+/// (case-insensitive) label match. Returns the real label OpenCode
+/// expects on the wire (`options`' own casing), not the caller's input.
 fn resolve_question_choice(choice: &str, options: &[String]) -> Option<String> {
     if let Ok(index) = choice.trim().parse::<usize>() {
         if let Some(label) = options.get(index) {
@@ -621,6 +626,25 @@ fn resolve_question_choice(choice: &str, options: &[String]) -> Option<String> {
         .iter()
         .find(|label| label.eq_ignore_ascii_case(choice.trim()))
         .cloned()
+}
+
+/// Resolves a `holler-server answer` `choice` against every pending
+/// question in order (issue #139): comma-separated for more than one
+/// question (`"Yes,2,No"` for a 3-question request), a bare single value
+/// for the overwhelmingly common one-question case (no comma required).
+/// Fails closed — `None` — the moment the segment count doesn't match
+/// `options.len()`, or any individual segment doesn't resolve against its
+/// own question's options; a partial answer is never sent.
+fn resolve_question_choices(choice: &str, options: &[Vec<String>]) -> Option<Vec<String>> {
+    let segments: Vec<&str> = choice.split(',').collect();
+    if segments.len() != options.len() {
+        return None;
+    }
+    segments
+        .iter()
+        .zip(options.iter())
+        .map(|(segment, question_options)| resolve_question_choice(segment, question_options))
+        .collect()
 }
 
 /// Drives one attached session: sends prompts via `prompt_async`, and
@@ -787,7 +811,7 @@ async fn poll_pending_question(
     client: &reqwest::Client,
     endpoint: &str,
     session_id: &str,
-    cfg: DebugConfig,
+    _cfg: DebugConfig,
 ) -> Option<PendingBlock> {
     let url = format!("{}/question", endpoint.trim_end_matches('/'));
     let response = client.get(&url).send().await.ok()?;
@@ -796,21 +820,19 @@ async fn poll_pending_question(
     }
     let requests: Vec<OcQuestionRequest> = response.json().await.ok()?;
     let request = requests.into_iter().find(|r| r.session_id == session_id)?;
-    if request.questions.len() != 1 {
-        // Scope cut (issue #133/#382): a single `choice` argument has no
-        // unambiguous way to answer more than one question in a request.
-        // Still report `Blocked` so the operator isn't left guessing why
-        // the turn is stuck, just without an answerable `PendingBlock`.
-        debug::warn(cfg, "http_attach", "answer")
-            .field("event", "multi_question_unsupported")
-            .field("session", session_id.to_string())
-            .emit();
+    if request.questions.is_empty() {
+        // Malformed on OpenCode's side (a question request with no
+        // questions in it) -- nothing to resolve `answer` against, and
+        // reporting `Blocked` for a request with nothing to answer would
+        // just leave an operator stuck with no way to clear it.
         return None;
     }
-    let options = request.questions[0]
-        .options
+    // Issue #133/#382/#139: one entry per question, in order, so `answer`
+    // can resolve a comma-separated `choice` against each independently.
+    let options: Vec<Vec<String>> = request
+        .questions
         .iter()
-        .map(|o| o.label.clone())
+        .map(|q| q.options.iter().map(|o| o.label.clone()).collect())
         .collect();
     Some(PendingBlock {
         kind: BlockKind::Question,
