@@ -67,6 +67,38 @@ session_id = "ses_…"                # the id of the session already running in
 
 `holler run --config attach.toml` against this config never execs `opencode`, never calls OpenCode's `session/new`, and — per the detach note above — never tears down the attached session on shutdown/detach. Mixing modes in one file (some sessions spawned, some attached) is fine. See [ADR 0005](docs/adr/ADR-0005.md) for the full policy and [holler-server](https://github.com/Performant-Labs/holler-server)'s `docs/protocol/talk.md` for the attach hop once that lands.
 
+### Answering a question or tool-use permission (attach mode)
+
+An attach-mode session polls OpenCode's own `GET /question`/`GET /permission` endpoints every
+`BLOCK_POLL_INTERVAL` (currently 750ms) for this session's `session_id`. When one is pending —
+a real OpenCode `question` tool call, or a tool-use permission gate — the turn is genuinely
+stuck until it's answered: no amount of `say`ing a new prompt will get past it. This client
+detects that state on its own and surfaces it as `DriverStatus::Blocked`, but **it does not
+answer it itself** — answering is a server-side command, sent from wherever `holler-server`
+runs:
+
+```
+holler-server answer <session> "<option label or index>"
+```
+
+`<choice>` is resolved against whatever's actually pending: for a question, a 0-based index
+into its options or the option's exact label (case-insensitive); for a permission, one of
+`once`/`always`/`reject` (aliases: `allow`/`approve`/`yes`/`y` → `once`, `deny`/`no`/`n` →
+`reject`). This client POSTs the real reply straight to OpenCode's `/question/{id}/reply` or
+`/permission/{id}/reply` — it never invents an answer or guesses at one.
+
+**Known gaps (issue #133):**
+- Spawn-mode sessions can't be answered this way yet — only attach mode detects/answers a
+  block; a spawn-mode `answer` call fails with `DriverError::AnswerUnsupported`. ACP's own
+  `session/request_permission` needs inbound-RPC plumbing this client doesn't have yet.
+- A request with more than one question in it isn't answerable via a single `choice` argument
+  — `Blocked` still fires so the operator isn't left guessing, but there's no unambiguous way
+  to answer it yet.
+- **`Blocked` isn't surfaced in `presence`/`roster`/`status` today** — the detect-and-reply
+  mechanism itself works, but there's no signal on the server side that a session is blocked on
+  a question specifically, versus just being slow. A stuck `say` with no reply, on a session you
+  know is attach-mode, is the current tell that it's worth checking.
+
 ### Dev scripts
 
 Wraps the connect side of a manual cross-machine test (tunnel + run) per the org's `object:sub-object:verb` script-naming convention ([`Performant-Labs/playbook`](https://github.com/Performant-Labs/playbook/blob/main/frameworks/node/npm-scripts.md)). This crate has no `package.json`, so `./scripts/run <name>` is the `npm run <name>` equivalent — the actual command you type, not just a documented mapping:
