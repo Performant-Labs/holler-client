@@ -59,7 +59,7 @@
 //! reverse: it drops a marker file that the live `run` process polls for
 //! and, on seeing it, closes its socket and exits.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -613,6 +613,38 @@ async fn session_loop(
 ) -> LoopExit {
     state.mark_connected();
 
+    // Issue #139: a session already blocked before this connection came
+    // up (a fresh `run` process, or a reconnect after a drop mid-block)
+    // gets its `session_blocked` pushed once here, right alongside
+    // `presence` -- `DriverStatus::Blocked` only fires on the
+    // *transition* into blocked, which this moment does not repeat.
+    // Which sessions this connection has last told the server are
+    // `Blocked`, so a later `session_blocked` frame is only sent on a
+    // real transition -- `DriverStatus::Working` fires on every ordinary
+    // prompt send too (not just an unblock), and re-announcing "still not
+    // blocked" on each one would be pure wire noise.
+    let mut blocked_sessions: HashSet<String> = HashSet::new();
+    if let Some(manager) = session_manager {
+        for name in event_channels.keys() {
+            if manager.is_blocked(name).await.unwrap_or(false) {
+                blocked_sessions.insert(name.clone());
+                let frame = proto::session_blocked(client_id, name, true);
+                let raw = proto::encode(&frame).expect("v1 session_blocked envelope always serializes");
+                debug::outgoing(cfg, "wire", "session_blocked")
+                    .id(&frame.id)
+                    .peer(client_id)
+                    .field("session", name.clone())
+                    .field("blocked", "true")
+                    .field("event", "resync_on_connect")
+                    .frame(|| raw.clone())
+                    .emit();
+                if ws.send(Message::Text(raw.into())).await.is_err() {
+                    return LoopExit::Dropped("failed to send session_blocked resync".to_string());
+                }
+            }
+        }
+    }
+
     let mut heartbeat = tokio::time::interval(heartbeat_interval());
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await; // interval's first tick fires immediately; skip it
@@ -961,11 +993,52 @@ async fn session_loop(
                             return LoopExit::Dropped("failed to send reply".to_string());
                         }
                     }
-                    // Presence/busy tracking is answered by the
-                    // `presence` frame at (re)connect time, not streamed
-                    // mid-turn — see module docs on issue #52's
-                    // "ask again" contract.
-                    DriverEvent::Status(DriverStatus::Working | DriverStatus::Idle | DriverStatus::Blocked) => {}
+                    // Ordinary busy/idle tracking is still answered only
+                    // by the `presence` frame at (re)connect time (issue
+                    // #52's "ask again" contract) -- but `Blocked` (issue
+                    // #133/#382) is a distinct, actionable "this session
+                    // needs an operator" signal that can't wait for the
+                    // next reconnect, so it alone is pushed live as a
+                    // `session_blocked` frame (issue #139), sent only on
+                    // an actual transition.
+                    DriverEvent::Status(DriverStatus::Working | DriverStatus::Idle) => {
+                        if blocked_sessions.remove(&name) {
+                            let frame = proto::session_blocked(client_id, &name, false);
+                            let raw = proto::encode(&frame)
+                                .expect("v1 session_blocked envelope always serializes");
+                            debug::outgoing(cfg, "wire", "session_blocked")
+                                .id(&frame.id)
+                                .peer(client_id)
+                                .field("session", name.clone())
+                                .field("blocked", "false")
+                                .frame(|| raw.clone())
+                                .emit();
+                            if ws.send(Message::Text(raw.into())).await.is_err() {
+                                return LoopExit::Dropped(
+                                    "failed to send session_blocked".to_string(),
+                                );
+                            }
+                        }
+                    }
+                    DriverEvent::Status(DriverStatus::Blocked) => {
+                        if blocked_sessions.insert(name.clone()) {
+                            let frame = proto::session_blocked(client_id, &name, true);
+                            let raw = proto::encode(&frame)
+                                .expect("v1 session_blocked envelope always serializes");
+                            debug::outgoing(cfg, "wire", "session_blocked")
+                                .id(&frame.id)
+                                .peer(client_id)
+                                .field("session", name.clone())
+                                .field("blocked", "true")
+                                .frame(|| raw.clone())
+                                .emit();
+                            if ws.send(Message::Text(raw.into())).await.is_err() {
+                                return LoopExit::Dropped(
+                                    "failed to send session_blocked".to_string(),
+                                );
+                            }
+                        }
+                    }
                 }
             }
             // Debounce expiry: release whichever sessions' windows have

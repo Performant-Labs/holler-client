@@ -167,6 +167,27 @@ command = ["{stub_acp}", "--chunks", "{chunks}", "--pause-after-chunk", "{pause_
         self
     }
 
+    /// Rewrites this env's config to one attach-mode session (issue #139's
+    /// `session_blocked` push needs a real attach driver -- spawn-mode
+    /// sessions never emit `DriverStatus::Blocked` at all).
+    fn with_attach_session(self, name: &str, endpoint: &str, session_id: &str) -> Self {
+        std::fs::write(
+            &self.config_path,
+            format!(
+                r#"
+[[session]]
+name = "{name}"
+harness = "opencode"
+mode = "attach"
+endpoint = "{endpoint}"
+session_id = "{session_id}"
+"#
+            ),
+        )
+        .unwrap();
+        self
+    }
+
     fn with_stub_acp_sessions(self) -> Self {
         let stub_acp = env!("CARGO_BIN_EXE_stub-acp");
         std::fs::write(
@@ -436,6 +457,142 @@ fn interrupt_envelope(session: &str) -> proto::Envelope {
         body: Body::Interrupt(proto::InterruptBody {
             session: session.to_string(),
         }),
+    }
+}
+
+fn answer_envelope(session: &str, choice: &str) -> proto::Envelope {
+    proto::Envelope {
+        v: 1,
+        msg_type: proto::MessageType::Answer,
+        id: proto::new_id(),
+        ts: "2026-01-01T00:00:00Z".to_string(),
+        from: "server".to_string(),
+        body: Body::Answer(proto::AnswerBody {
+            session: session.to_string(),
+            choice: choice.to_string(),
+        }),
+    }
+}
+
+/// A minimal, real (std-only, no async) OpenCode HTTP double for issue
+/// #139's connection-level `session_blocked` push -- the spawned real
+/// `holler run` child process reaches this over real loopback HTTP, so it
+/// has to be an actual listening server, not an in-process mock. A
+/// stripped-down copy of `http_attach_answer_test.rs`'s own `FakeOpenCode`
+/// (no shared test-helpers crate between files in this repo -- see that
+/// file's module doc for why), trimmed to only what this file's tests need:
+/// serving `/api/session/{id}` (existence check), `/event` (SSE, held open,
+/// never emits anything), `GET /question`, and `POST /question/{id}/reply`.
+struct FakeOpenCode {
+    addr: std::net::SocketAddr,
+    pending_question: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+}
+
+impl FakeOpenCode {
+    fn start() -> Self {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        let pending_question = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let q = pending_question.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let q = q.clone();
+                std::thread::spawn(move || Self::handle_connection(stream, q));
+            }
+        });
+        FakeOpenCode { addr, pending_question }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn set_pending_question(&self, id: &str, session_id: &str, options: &[&str]) {
+        *self.pending_question.lock().unwrap() = Some(serde_json::json!({
+            "id": id,
+            "sessionID": session_id,
+            "questions": [{
+                "question": "Which way?",
+                "header": "Which way?",
+                "options": options.iter().map(|o| serde_json::json!({"label": o, "description": ""})).collect::<Vec<_>>(),
+            }],
+        }));
+    }
+
+    fn handle_connection(
+        mut stream: std::net::TcpStream,
+        pending_question: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    ) {
+        use std::io::{Read, Write};
+        let mut buf = [0u8; 8192];
+        let mut received = Vec::new();
+        let headers_end = loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    received.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos;
+                    }
+                }
+            }
+        };
+        let head = String::from_utf8_lossy(&received[..headers_end]).to_string();
+        let mut lines = head.lines();
+        let request_line = lines.next().unwrap_or_default().to_string();
+        let content_length: usize = lines
+            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_string()))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut body = received[headers_end + 4..].to_vec();
+        while body.len() < content_length {
+            let mut chunk = [0u8; 4096];
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => body.extend_from_slice(&chunk[..n]),
+            }
+        }
+
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("");
+
+        let write_json = |stream: &mut std::net::TcpStream, status: &str, body: &serde_json::Value| {
+            let payload = body.to_string();
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                )
+                .as_bytes(),
+            );
+        };
+
+        if method == "GET" && path.starts_with("/api/session/") {
+            write_json(&mut stream, "200 OK", &serde_json::json!({}));
+        } else if method == "GET" && path == "/event" {
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n");
+            let mut sink = [0u8; 1];
+            let _ = stream.read(&mut sink);
+        } else if method == "GET" && path == "/question" {
+            let list = match pending_question.lock().unwrap().clone() {
+                Some(q) => vec![q],
+                None => vec![],
+            };
+            write_json(&mut stream, "200 OK", &serde_json::Value::Array(list));
+        } else if method == "GET" && path == "/permission" {
+            write_json(&mut stream, "200 OK", &serde_json::Value::Array(vec![]));
+        } else if method == "POST" && path.starts_with("/question/") && path.ends_with("/reply") {
+            *pending_question.lock().unwrap() = None;
+            write_json(&mut stream, "200 OK", &serde_json::Value::Bool(true));
+        } else if method == "POST" {
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+        } else {
+            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        }
     }
 }
 
@@ -1377,6 +1534,131 @@ async fn presence_advertises_confirmed_sessions_with_busy_state() {
             }
         }
         other => panic!("expected Presence, got {other:?}"),
+    }
+
+    kill(child);
+}
+
+/// Issue #139: a real OpenCode question blocking an attach-mode session's
+/// turn is pushed live as `session_blocked`, not held back for the next
+/// presence/reconnect -- and clears the same way once answered.
+#[tokio::test]
+async fn session_blocked_is_pushed_live_and_cleared_when_answered() {
+    let opencode = FakeOpenCode::start();
+    opencode.set_pending_question("que_sb1", "ses_sb_test", &["Yes", "No"]);
+    let env = Env::new().with_attach_session("test-alpha", &opencode.base_url(), "ses_sb_test");
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "tok_sb1", "cli_sb1", "sb-host");
+
+    let child = spawn_run(&env);
+
+    let mut ws = accept_ws(&listener).await;
+    expect_auth(&mut ws, "tok_sb1").await;
+    send_envelope(&mut ws, &server_hello_envelope()).await;
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `hello`");
+    next_envelope(&mut ws)
+        .await
+        .expect("expected client `presence`");
+
+    let blocked_frame = next_envelope(&mut ws)
+        .await
+        .expect("expected a session_blocked push once the poll loop detects the question");
+    match blocked_frame.body {
+        Body::SessionBlocked(proto::SessionBlockedBody { session, blocked }) => {
+            assert_eq!(session, "test-alpha");
+            assert!(blocked, "must push blocked:true, not wait for a reconnect");
+        }
+        other => panic!("expected SessionBlocked, got {other:?}"),
+    }
+
+    send_envelope(&mut ws, &answer_envelope("test-alpha", "0")).await;
+
+    // The `answer` dispatch's own `ack` and the poll loop's later
+    // `session_blocked(false)` are two independent events -- accept
+    // either order, and tolerate the ack arriving in between, rather than
+    // assuming exact adjacency.
+    let mut saw_ack = false;
+    let mut saw_unblocked = false;
+    while !saw_ack || !saw_unblocked {
+        let frame = next_envelope(&mut ws)
+            .await
+            .expect("expected the answer's ack and the unblock push");
+        match frame.body {
+            Body::Ack(_) => saw_ack = true,
+            Body::SessionBlocked(proto::SessionBlockedBody { session, blocked }) => {
+                assert_eq!(session, "test-alpha");
+                assert!(!blocked, "must push blocked:false once the question is answered");
+                saw_unblocked = true;
+            }
+            other => panic!("expected Ack or SessionBlocked, got {other:?}"),
+        }
+    }
+
+    kill(child);
+}
+
+/// Issue #139: a session already blocked when a connection drops stays
+/// blocked on the driver side (the pending question never went away) --
+/// the fresh connection must resync that on its own, since
+/// `DriverStatus::Blocked` only fires on the *transition* into blocked,
+/// which a reconnect does not repeat.
+#[tokio::test]
+async fn session_blocked_is_resynced_on_reconnect_without_a_fresh_transition() {
+    let opencode = FakeOpenCode::start();
+    opencode.set_pending_question("que_sb2", "ses_sb_test2", &["Yes", "No"]);
+    let env = Env::new().with_attach_session("test-alpha", &opencode.base_url(), "ses_sb_test2");
+    let (listener, url) = bind_local().await;
+    env.write_credential(&url, "hlr_live_good", "tok_sb2", "cli_sb2", "sb-host2");
+
+    let child = spawn_run(&env);
+
+    // First connection: let the poll loop detect the block, then drop
+    // the connection without ever answering it.
+    {
+        let mut ws = accept_ws(&listener).await;
+        expect_auth(&mut ws, "tok_sb2").await;
+        send_envelope(&mut ws, &server_hello_envelope()).await;
+        next_envelope(&mut ws)
+            .await
+            .expect("expected client `hello`");
+        next_envelope(&mut ws)
+            .await
+            .expect("expected client `presence`");
+        let frame = next_envelope(&mut ws)
+            .await
+            .expect("expected the initial session_blocked push");
+        match frame.body {
+            Body::SessionBlocked(proto::SessionBlockedBody { blocked, .. }) => assert!(blocked),
+            other => panic!("expected SessionBlocked, got {other:?}"),
+        }
+        let _ = ws.close(None).await;
+    }
+
+    env.wait_for_status(STATUS_BUDGET, |doc| doc["reconnecting"] == true);
+
+    // Second connection: the session is still blocked (never answered) --
+    // the resync must fire right alongside presence, with no need for a
+    // fresh transition.
+    let mut ws2 = accept_ws(&listener).await;
+    expect_auth(&mut ws2, "tok_sb2").await;
+    send_envelope(&mut ws2, &server_hello_envelope()).await;
+    next_envelope(&mut ws2)
+        .await
+        .expect("expected client `hello`");
+    next_envelope(&mut ws2)
+        .await
+        .expect("expected client `presence`");
+    let resync_frame = next_envelope(&mut ws2)
+        .await
+        .expect("expected a resync session_blocked push on the new connection");
+    match resync_frame.body {
+        Body::SessionBlocked(proto::SessionBlockedBody { session, blocked }) => {
+            assert_eq!(session, "test-alpha");
+            assert!(blocked, "a still-blocked session must resync on reconnect");
+        }
+        other => panic!("expected SessionBlocked, got {other:?}"),
     }
 
     kill(child);

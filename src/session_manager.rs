@@ -49,7 +49,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Sleep;
 
-use crate::acp_driver::{AcpDriver, DriverError, DriverEvent};
+use crate::acp_driver::{AcpDriver, DriverError, DriverEvent, DriverStatus};
 use crate::config::{SessionConfig, SessionMode, SessionRegistry};
 use crate::debug::{self, DebugConfig};
 use crate::http_attach_driver::HttpAttachDriver;
@@ -201,6 +201,12 @@ enum ManagerCommand {
     /// `busy` field). Answered synchronously from `run_session`'s own
     /// `busy` flag, the same one `Prompt`/`Interrupt` already consult.
     IsBusy(oneshot::Sender<bool>),
+    /// Whether this session is currently blocked on a question/permission
+    /// (issue #139: `session_blocked`'s reconnect-time resync). Answered
+    /// from `run_session`'s own `blocked` flag, set/cleared by the same
+    /// `DriverEvent::Status` transitions `crate::connection`'s live push
+    /// reacts to.
+    IsBlocked(oneshot::Sender<bool>),
 }
 
 /// One configured session's live runtime: its background task handle, the
@@ -346,6 +352,26 @@ impl SessionManager {
         reply_rx.await.map_err(|_| ManagerError::Disconnected)
     }
 
+    /// Whether the named session is currently blocked on a question or
+    /// tool-use permission (issue #139) — the same `blocked` flag
+    /// `crate::connection`'s live `session_blocked` push already reacts
+    /// to, surfaced here so a fresh (re)connection can resync a session
+    /// that was already blocked before the previous connection dropped
+    /// (a `DriverEvent::Status(Blocked)` only fires on the *transition*
+    /// into blocked, which a reconnect does not repeat).
+    pub async fn is_blocked(&self, name: &str) -> Result<bool, ManagerError> {
+        let handle = self
+            .handles
+            .get(name)
+            .ok_or_else(|| ManagerError::UnknownSession(name.to_string()))?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .command_tx
+            .send(ManagerCommand::IsBlocked(reply_tx))
+            .map_err(|_| ManagerError::Disconnected)?;
+        reply_rx.await.map_err(|_| ManagerError::Disconnected)
+    }
+
     /// The name of every session this manager is driving.
     pub fn session_names(&self) -> Vec<String> {
         self.handles.keys().cloned().collect()
@@ -401,6 +427,10 @@ async fn run_session(
 ) {
     let mut queue: VecDeque<String> = VecDeque::new();
     let mut busy = false;
+    // Issue #139: mirrors the driver's own `DriverStatus::Blocked`
+    // transitions, so `is_blocked` (a reconnect-time resync query) has
+    // something to answer without waiting for a fresh transition.
+    let mut blocked = false;
     // Once the driven ACP connection ends, `driver.next_event()` has
     // nothing left to ever produce — polling it further would just spin.
     // From that point on this task only services `Interrupt` (so a turn
@@ -457,6 +487,9 @@ async fn run_session(
                         Some(ManagerCommand::IsBusy(reply_tx)) => {
                             let _ = reply_tx.send(busy);
                         }
+                        Some(ManagerCommand::IsBlocked(reply_tx)) => {
+                            let _ = reply_tx.send(blocked);
+                        }
                     }
                 }
                 event = driver.next_event() => {
@@ -464,6 +497,13 @@ async fn run_session(
                         None => driver_alive = false,
                         Some(driver_event) => {
                             let turn_ended = matches!(driver_event, DriverEvent::StopReason(_));
+                            match &driver_event {
+                                DriverEvent::Status(DriverStatus::Blocked) => blocked = true,
+                                DriverEvent::Status(DriverStatus::Working | DriverStatus::Idle) => {
+                                    blocked = false
+                                }
+                                _ => {}
+                            }
                             let _ = event_tx.send(driver_event);
                             if turn_ended {
                                 interrupt_deadline = None;
@@ -524,6 +564,9 @@ async fn run_session(
                 }
                 Some(ManagerCommand::IsBusy(reply_tx)) => {
                     let _ = reply_tx.send(busy);
+                }
+                Some(ManagerCommand::IsBlocked(reply_tx)) => {
+                    let _ = reply_tx.send(blocked);
                 }
             }
         }

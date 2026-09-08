@@ -12,6 +12,11 @@ pre-decision history.
 
 ### Enhancements
 
+- A session's `Blocked` status (a real OpenCode question/permission gate) is now pushed
+  live to the server as a new `session_blocked` wire message (issue #139), the moment the
+  transition happens — not just at connect/reconnect like `presence`. A session already
+  blocked when a connection drops is resynced right after `presence` on the fresh
+  connection, since the transition itself does not repeat.
 - `answer` now resolves a request with more than one pending question (issue #139) — a
   comma-separated `choice`, one segment per question in order (each an index or exact
   label), resolved independently against its own question's options. A single-question

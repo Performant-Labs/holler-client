@@ -87,19 +87,21 @@ into its options or the option's exact label (case-insensitive); for a permissio
 `reject`). This client POSTs the real reply straight to OpenCode's `/question/{id}/reply` or
 `/permission/{id}/reply` — it never invents an answer or guesses at one.
 
+A session's `Blocked` status is pushed to the server live (issue #139), the moment the
+transition happens — a new `session_blocked` wire message, distinct from `presence`
+(which is connect-time only). `holler-server roster` shows it directly in a `BLOCKED`
+column, so an operator watching the roster doesn't have to wait for a stuck `say` to
+notice a session needs an answer.
+
 A request with **more than one question** in it (issue #139) is answered with a
 comma-separated `choice`, one segment per question in order — e.g. `"Yes,2,No"` for a
 3-question request, each segment an index or exact label resolved against that question's own
 options. A single-question request needs no comma, exactly as shown above.
 
-**Known gaps (issue #139):**
+**Known gaps (issue #133):**
 - Spawn-mode sessions can't be answered this way yet — only attach mode detects/answers a
   block; a spawn-mode `answer` call fails with `DriverError::AnswerUnsupported`. ACP's own
   `session/request_permission` needs inbound-RPC plumbing this client doesn't have yet.
-- **`Blocked` isn't surfaced in `presence`/`roster`/`status` today** — the detect-and-reply
-  mechanism itself works, but there's no signal on the server side that a session is blocked on
-  a question specifically, versus just being slow. A stuck `say` with no reply, on a session you
-  know is attach-mode, is the current tell that it's worth checking.
 
 ### Dev scripts
 
