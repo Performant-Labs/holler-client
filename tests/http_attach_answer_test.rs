@@ -64,6 +64,22 @@ impl FakeOpenCode {
         }));
     }
 
+    /// A request with more than one question in it (issue #139) — each
+    /// `(question_text, options)` pair becomes one entry in `questions`,
+    /// in order, matching the order `answer`'s comma-separated `choice`
+    /// segments must resolve against.
+    fn set_pending_multi_question(&self, id: &str, questions: &[(&str, &[&str])]) {
+        *self.pending_question.lock().unwrap() = Some(json!({
+            "id": id,
+            "sessionID": "ses_test",
+            "questions": questions.iter().map(|(text, options)| json!({
+                "question": text,
+                "header": text,
+                "options": options.iter().map(|o| json!({"label": o, "description": ""})).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }));
+    }
+
     fn set_pending_permission(&self, id: &str) {
         *self.pending_permission.lock().unwrap() = Some(json!({
             "id": id,
@@ -332,6 +348,75 @@ async fn answering_clears_the_blocked_status_on_the_next_poll() {
         manager.next_event("alpha").await.unwrap(),
         Some(DriverEvent::Status(DriverStatus::Working)),
         "the next poll tick must observe the question is gone and report unblocked"
+    );
+
+    manager.shutdown().await;
+}
+
+/// A request with more than one question (issue #139) still surfaces as
+/// `Blocked` and is resolvable via a comma-separated `choice`, one
+/// segment per question in order — each resolved independently (index or
+/// exact label) against its own question's options.
+#[tokio::test]
+async fn answer_resolves_a_multi_question_request_by_comma_separated_choices() {
+    let server = FakeOpenCode::start();
+    server.set_pending_multi_question(
+        "que_multi",
+        &[
+            ("Which way?", &["Yes", "No"]),
+            ("How sure?", &["Certain", "Somewhat", "Guessing"]),
+        ],
+    );
+    let registry = SessionRegistry::from_configs(vec![attach_config("alpha", server.base_url())]).unwrap();
+    let mut manager = SessionManager::spawn(&registry, None, DebugConfig::default())
+        .await
+        .expect("attach should succeed");
+
+    assert_eq!(
+        manager.next_event("alpha").await.unwrap(),
+        Some(DriverEvent::Status(DriverStatus::Blocked)),
+        "a multi-question request must still surface as Blocked, not be silently dropped"
+    );
+
+    manager
+        .answer("alpha", "No,0".to_string())
+        .await
+        .expect("a comma-separated choice, one per question, should resolve and succeed");
+
+    let replies = server.recorded_replies();
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert_eq!(replies[0].0, "/question/que_multi/reply");
+    assert_eq!(replies[0].1, json!({"answers": [["No"], ["Certain"]]}));
+
+    manager.shutdown().await;
+}
+
+/// A `choice` with the wrong number of comma-separated segments (relative
+/// to how many questions are actually pending) fails closed before any
+/// POST — never guesses which segment belongs to which question.
+#[tokio::test]
+async fn answer_with_wrong_number_of_choices_for_a_multi_question_request_fails_closed() {
+    let server = FakeOpenCode::start();
+    server.set_pending_multi_question(
+        "que_multi_2",
+        &[("Which way?", &["Yes", "No"]), ("How sure?", &["Certain", "Guessing"])],
+    );
+    let registry = SessionRegistry::from_configs(vec![attach_config("alpha", server.base_url())]).unwrap();
+    let mut manager = SessionManager::spawn(&registry, None, DebugConfig::default())
+        .await
+        .expect("attach should succeed");
+
+    manager.next_event("alpha").await.unwrap();
+
+    // Only one segment for a two-question request.
+    match manager.answer("alpha", "Yes".to_string()).await {
+        Err(ManagerError::Driver(DriverError::NoPendingAnswer(_))) => {}
+        other => panic!("expected NoPendingAnswer for a segment-count mismatch, got {other:?}"),
+    }
+
+    assert!(
+        server.recorded_replies().is_empty(),
+        "a mismatched choice count must never POST a partial/guessed answer"
     );
 
     manager.shutdown().await;
