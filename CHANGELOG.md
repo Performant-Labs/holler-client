@@ -10,6 +10,14 @@ pre-decision history.
 
 ## [Unreleased]
 
+### Enhancements
+
+- A session's `Blocked` status (a real OpenCode question/permission gate) is now pushed
+  live to the server as a new `session_blocked` wire message (issue #139), the moment the
+  transition happens — not just at connect/reconnect like `presence`. A session already
+  blocked when a connection drops is resynced right after `presence` on the fresh
+  connection, since the transition itself does not repeat.
+
 ## [0.1.1] - 2026-09-07
 
 ### Enhancements

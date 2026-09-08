@@ -98,6 +98,11 @@ pub enum MessageType {
     Answer,
     #[serde(rename = "presence")]
     Presence,
+    /// client → server: a session's `Blocked` status just transitioned,
+    /// in either direction (issue #139). Pushed live, unlike `presence`
+    /// (connect-time only) — see [`SessionBlockedBody`]'s doc comment.
+    #[serde(rename = "session_blocked")]
+    SessionBlocked,
     #[serde(rename = "ack")]
     Ack,
     /// Any other v1 type. Carries the original wire string so a log line
@@ -123,6 +128,7 @@ impl MessageType {
             "interrupt" => Self::Interrupt,
             "answer" => Self::Answer,
             "presence" => Self::Presence,
+            "session_blocked" => Self::SessionBlocked,
             "ack" => Self::Ack,
             _ => Self::Unknown,
         }
@@ -144,6 +150,7 @@ impl MessageType {
             Self::Interrupt => "interrupt",
             Self::Answer => "answer",
             Self::Presence => "presence",
+            Self::SessionBlocked => "session_blocked",
             Self::Ack => "ack",
             Self::Unknown => "unknown",
         }
@@ -308,6 +315,19 @@ pub struct PresenceBody {
     pub sessions: Vec<Value>,
 }
 
+/// `session_blocked` body (issue #139, not in the original v1 spec — an
+/// extension the same way `answer` was): the named session's `Blocked`
+/// status just changed. Unlike `presence` (spec §10: advertised once at
+/// connect, a heartbeat snapshot), this is pushed the moment
+/// [`crate::session_manager`]'s `run_session` observes the transition,
+/// in either direction, so `holler-server roster` can reflect it without
+/// waiting for a reconnect.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct SessionBlockedBody {
+    pub session: String,
+    pub blocked: bool,
+}
+
 /// `ack` body (spec §10): optional receipt referencing the acknowledged
 /// frame's id.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
@@ -341,6 +361,7 @@ pub enum Body {
     Interrupt(InterruptBody),
     Answer(AnswerBody),
     Presence(PresenceBody),
+    SessionBlocked(SessionBlockedBody),
     Ack(AckBody),
     /// An undecoded frame body of a type this client doesn't implement,
     /// kept as raw JSON so nothing is lost from a log.
@@ -387,6 +408,7 @@ pub fn encode(envelope: &Envelope) -> serde_json::Result<String> {
         Body::Interrupt(b) => serde_json::to_value(b)?,
         Body::Answer(b) => serde_json::to_value(b)?,
         Body::Presence(b) => serde_json::to_value(b)?,
+        Body::SessionBlocked(b) => serde_json::to_value(b)?,
         Body::Ack(b) => serde_json::to_value(b)?,
         Body::Unknown(v) => v.clone(),
     };
@@ -495,6 +517,10 @@ pub fn decode(raw: &str) -> Result<Envelope, DecodeError> {
         MessageType::Presence => Body::Presence(
             serde_json::from_value(raw_body)
                 .map_err(|e| DecodeError::Malformed(format!("bad `presence` body: {e}")))?,
+        ),
+        MessageType::SessionBlocked => Body::SessionBlocked(
+            serde_json::from_value(raw_body)
+                .map_err(|e| DecodeError::Malformed(format!("bad `session_blocked` body: {e}")))?,
         ),
         MessageType::Ack => Body::Ack(
             serde_json::from_value(raw_body)
@@ -664,6 +690,26 @@ pub fn client_presence(from: &str, sessions: Vec<Value>) -> Envelope {
         ts: now_ts(),
         from: from.to_string(),
         body: Body::Presence(PresenceBody { sessions }),
+    }
+}
+
+/// This client's `session_blocked` push (issue #139): `session` just
+/// transitioned into (`blocked: true`) or out of (`blocked: false`) being
+/// stuck on a question/permission. Sent by `crate::connection`'s session
+/// loop on an actual `DriverStatus` transition, and once more at (re)connect
+/// for any session already blocked (a transition a reconnect does not
+/// repeat) — see [`SessionBlockedBody`]'s doc comment.
+pub fn session_blocked(from: &str, session: &str, blocked: bool) -> Envelope {
+    Envelope {
+        v: PROTOCOL_VERSION,
+        msg_type: MessageType::SessionBlocked,
+        id: new_id(),
+        ts: now_ts(),
+        from: from.to_string(),
+        body: Body::SessionBlocked(SessionBlockedBody {
+            session: session.to_string(),
+            blocked,
+        }),
     }
 }
 
@@ -949,6 +995,23 @@ mod tests {
         match decoded.body {
             Body::Presence(PresenceBody { sessions }) => assert_eq!(sessions, rows),
             other => panic!("expected Presence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_blocked_round_trips_both_directions() {
+        for blocked in [true, false] {
+            let env = session_blocked("cli_1", "alpha", blocked);
+            assert_eq!(env.msg_type.as_wire_str(), "session_blocked");
+            let raw = encode(&env).unwrap();
+            let decoded = decode(&raw).unwrap();
+            match decoded.body {
+                Body::SessionBlocked(SessionBlockedBody { session, blocked: b }) => {
+                    assert_eq!(session, "alpha");
+                    assert_eq!(b, blocked);
+                }
+                other => panic!("expected SessionBlocked, got {other:?}"),
+            }
         }
     }
 
